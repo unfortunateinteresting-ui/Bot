@@ -181,52 +181,95 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
     if qty <= 0:
         return None
     symbol = SYMBOL
+    use_cap = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
+    max_slip_pct = max(0.01, float(getattr(state, "max_slip_pct", MAX_SLIP_PCT_DEFAULT)))
+    best_pre = fetch_best_book_price(exchange, symbol, "buy", price_estimate)
+    limit_price = (best_pre or price_estimate) * (1 + max_slip_pct / 100.0) if use_cap else price_estimate
+    attempt = 0
+    filled_qty = 0.0
+    fill_price = price_estimate
 
-    if DRY_RUN:
-        if SIMULATE_SLIPPAGE_DRY_RUN:
-            filled_qty, fill_price, best, worst, used = simulate_dry_run_market_fill(
-                exchange, symbol, "buy", qty, price_estimate
-            )
-            # 'best' is best ask encountered; slippage is relative to that
-            slip_bps = 0.0
-            if best and best > 0:
-                slip_bps = (fill_price / best - 1.0) * 10000.0
-            # store for UI (and persistence via save_settings)
-            try:
-                with state.lock:
-                    state.last_slippage_bps = float(slip_bps)
-                    state.last_slippage_side = "BUY"
-                    state.last_slippage_best = float(best or 0.0)
-                    state.last_slippage_fill = float(fill_price)
-                    state.last_slippage_levels = int(used or 0)
-                    state.last_slippage_ts = time.time()
-            except Exception:
-                pass
-            log_event(
-                state,
-                f"MARKET BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
-                f"(book best={best:.8f}, worst={worst:.8f}, slip={slip_bps:.1f} bps, lvls={used})"
-            )
+    while attempt < (2 if use_cap else 1) and filled_qty <= 0:
+        attempt += 1
+        if DRY_RUN:
+            if SIMULATE_SLIPPAGE_DRY_RUN:
+                filled_qty, fill_price, best, worst, used = simulate_dry_run_market_fill(
+                    exchange, symbol, "buy", qty, limit_price
+                )
+                # enforce cap in simulation
+                if use_cap and fill_price > limit_price * 1.0000001:
+                    filled_qty = 0.0
+                slip_bps = 0.0
+                if best and best > 0 and filled_qty > 0:
+                    slip_bps = (fill_price / best - 1.0) * 10000.0
+                try:
+                    with state.lock:
+                        state.last_slippage_bps = float(slip_bps)
+                        state.last_slippage_side = "BUY"
+                        state.last_slippage_best = float(best or 0.0)
+                        state.last_slippage_fill = float(fill_price)
+                        state.last_slippage_levels = int(used or 0)
+                        state.last_slippage_ts = time.time()
+                except Exception:
+                    pass
+                log_event(
+                    state,
+                    f"IOC BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
+                    f"(cap={limit_price:.8f}, best={best:.8f}, worst={worst:.8f}, slip={slip_bps:.1f} bps, lvls={used}, attempt={attempt})"
+                )
+            else:
+                fill_price = limit_price
+                filled_qty = qty
+                try:
+                    with state.lock:
+                        state.last_slippage_bps = 0.0
+                        state.last_slippage_side = "BUY"
+                        state.last_slippage_best = float(limit_price or 0.0)
+                        state.last_slippage_fill = float(fill_price)
+                        state.last_slippage_levels = 0
+                        state.last_slippage_ts = time.time()
+                except Exception:
+                    pass
+                log_event(state, f"IOC BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} (cap={limit_price:.8f}, attempt={attempt})")
         else:
-            fill_price = price_estimate
-            filled_qty = qty
             try:
-                with state.lock:
-                    state.last_slippage_bps = 0.0
-                    state.last_slippage_side = "BUY"
-                    state.last_slippage_best = float(price_estimate or 0.0)
-                    state.last_slippage_fill = float(fill_price)
-                    state.last_slippage_levels = 0
-                    state.last_slippage_ts = time.time()
-            except Exception:
-                pass
-            log_event(state, f"MARKET BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f}")
-    else:
-        best_pre = fetch_best_book_price(exchange, symbol, "buy", price_estimate)
+                params = {"timeInForce": "IOC"} if use_cap else {}
+                order = exchange.create_order(symbol, "limit" if use_cap else "market", "buy", qty, limit_price, params)
+                filled_qty = float(order.get("filled") or order.get("amount") or 0.0)
+                fill_price = float(order.get("average") or order.get("price") or limit_price)
+                slip_bps = 0.0
+                if best_pre and best_pre > 0 and filled_qty > 0:
+                    slip_bps = (fill_price / best_pre - 1.0) * 10000.0
+                try:
+                    with state.lock:
+                        state.last_slippage_bps = float(slip_bps)
+                        state.last_slippage_side = "BUY"
+                        state.last_slippage_best = float(best_pre or 0.0)
+                        state.last_slippage_fill = float(fill_price)
+                        state.last_slippage_levels = 0
+                        state.last_slippage_ts = time.time()
+                except Exception:
+                    pass
+                log_event(
+                    state,
+                    f"{'IOC' if use_cap else 'MARKET'} BUY filled {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
+                    f"(best={best_pre:.8f}, cap={limit_price:.8f}, slip={slip_bps:.1f} bps, attempt={attempt})"
+                )
+            except Exception as e:
+                log_event(state, f"[ERROR] BUY attempt {attempt} error: {e}")
+                filled_qty = 0.0
+
+        if filled_qty <= 0 and use_cap and attempt == 1:
+            # widen cap by 50% for one retry; last resort fallback to market after loop
+            limit_price = (best_pre or price_estimate) * (1 + (max_slip_pct * 1.5) / 100.0)
+            continue
+
+    if filled_qty <= 0 and use_cap:
+        # final fallback: plain market to avoid missing critical fills
         try:
-            order = exchange.create_order(symbol, "market", "buy", qty, price_estimate)
+            order = exchange.create_order(symbol, "market", "buy", qty)
             filled_qty = float(order.get("filled") or order.get("amount") or qty)
-            fill_price = float(order.get("average") or order.get("price") or price_estimate)
+            fill_price = float(order.get("average") or order.get("price") or limit_price)
             slip_bps = 0.0
             if best_pre and best_pre > 0:
                 slip_bps = (fill_price / best_pre - 1.0) * 10000.0
@@ -240,9 +283,9 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
                     state.last_slippage_ts = time.time()
             except Exception:
                 pass
-            log_event(state, f"MARKET BUY filled {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} (best={best_pre:.8f}, slip={slip_bps:.1f} bps)")
+            log_event(state, f"MARKET BUY fallback filled {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} (best={best_pre:.8f}, slip={slip_bps:.1f} bps)")
         except Exception as e:
-            log_event(state, f"[ERROR] Market BUY error: {e}")
+            log_event(state, f"[ERROR] Market BUY fallback error: {e}")
             return None
 
     cost_notional = filled_qty * fill_price
@@ -271,12 +314,19 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
         return 0.0, price_estimate
 
     symbol = position.symbol
+    use_cap = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
+    max_slip_pct = max(0.01, float(getattr(state, "max_slip_pct", MAX_SLIP_PCT_DEFAULT)))
 
     if DRY_RUN:
         if SIMULATE_SLIPPAGE_DRY_RUN:
             filled_qty, fill_price, best, worst, used = simulate_dry_run_market_fill(
                 exchange, symbol, "sell", qty_exit, price_estimate
             )
+            if use_cap:
+                best_bid = fetch_best_book_price(exchange, symbol, "sell", price_estimate)
+                limit_price = (best_bid or price_estimate) * (1 - max_slip_pct / 100.0)
+                if fill_price < limit_price * 0.999999:
+                    filled_qty = 0.0
             slip_bps = 0.0
             if best and best > 0:
                 # for sells, worse fill is LOWER than best bid => positive bps
@@ -331,28 +381,67 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
         return 0.0, price_estimate
 
     best_pre = fetch_best_book_price(exchange, symbol, "sell", price_estimate)
-    try:
-        order = exchange.create_order(symbol, "market", "sell", qty_to_sell)
-        filled_qty = float(order.get("filled") or order.get("amount") or qty_to_sell)
-        fill_price = float(order.get("average") or order.get("price") or price_estimate)
-        slip_bps = 0.0
-        if best_pre and best_pre > 0:
-            slip_bps = (1.0 - fill_price / best_pre) * 10000.0
+    limit_price = (best_pre or price_estimate) * (1 - max_slip_pct / 100.0) if use_cap else price_estimate
+    attempt = 0
+    filled_qty = 0.0
+    fill_price = price_estimate
+
+    while attempt < (2 if use_cap else 1) and filled_qty <= 0:
+        attempt += 1
         try:
-            with state.lock:
-                state.last_slippage_bps = float(slip_bps)
-                state.last_slippage_side = "SELL"
-                state.last_slippage_best = float(best_pre or 0.0)
-                state.last_slippage_fill = float(fill_price)
-                state.last_slippage_levels = 0
-                state.last_slippage_ts = time.time()
-        except Exception:
-            pass
-        log_event(state, f"MARKET SELL filled {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} (best={best_pre:.8f}, slip={slip_bps:.1f} bps)")
-        return filled_qty, fill_price
-    except Exception as e:
-        log_event(state, f"[ERROR] Market SELL error: {e}")
-        return 0.0, price_estimate
+            params = {"timeInForce": "IOC"} if use_cap else {}
+            order = exchange.create_order(symbol, "limit" if use_cap else "market", "sell", qty_to_sell, limit_price, params)
+            filled_qty = float(order.get("filled") or order.get("amount") or 0.0)
+            fill_price = float(order.get("average") or order.get("price") or limit_price)
+            slip_bps = 0.0
+            if best_pre and best_pre > 0 and filled_qty > 0:
+                slip_bps = (1.0 - fill_price / best_pre) * 10000.0
+            try:
+                with state.lock:
+                    state.last_slippage_bps = float(slip_bps)
+                    state.last_slippage_side = "SELL"
+                    state.last_slippage_best = float(best_pre or 0.0)
+                    state.last_slippage_fill = float(fill_price)
+                    state.last_slippage_levels = 0
+                    state.last_slippage_ts = time.time()
+            except Exception:
+                pass
+            log_event(
+                state,
+                f"{'IOC' if use_cap else 'MARKET'} SELL filled {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
+                f"(best={best_pre:.8f}, cap={limit_price:.8f}, slip={slip_bps:.1f} bps, attempt={attempt})"
+            )
+        except Exception as e:
+            log_event(state, f"[ERROR] SELL attempt {attempt} error: {e}")
+            filled_qty = 0.0
+
+        if filled_qty <= 0 and use_cap and attempt == 1:
+            limit_price = (best_pre or price_estimate) * (1 - (max_slip_pct * 1.5) / 100.0)
+            continue
+
+    if filled_qty <= 0 and use_cap:
+        try:
+            order = exchange.create_order(symbol, "market", "sell", qty_to_sell)
+            filled_qty = float(order.get("filled") or order.get("amount") or qty_to_sell)
+            fill_price = float(order.get("average") or order.get("price") or price_estimate)
+            slip_bps = 0.0
+            if best_pre and best_pre > 0:
+                slip_bps = (1.0 - fill_price / best_pre) * 10000.0
+            try:
+                with state.lock:
+                    state.last_slippage_bps = float(slip_bps)
+                    state.last_slippage_side = "SELL"
+                    state.last_slippage_best = float(best_pre or 0.0)
+                    state.last_slippage_fill = float(fill_price)
+                    state.last_slippage_levels = 0
+                    state.last_slippage_ts = time.time()
+            except Exception:
+                pass
+            log_event(state, f"MARKET SELL fallback filled {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} (best={best_pre:.8f}, slip={slip_bps:.1f} bps)")
+        except Exception as e:
+            log_event(state, f"[ERROR] Market SELL fallback error: {e}")
+            return 0.0, price_estimate
+    return filled_qty, fill_price
 
 
 def place_limit_buy(exchange: ccxt.Exchange, state: BotState, price: float, usdt_to_spend: float,
@@ -454,7 +543,7 @@ def check_open_order(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame)
 
     last_row = df.iloc[-1]
 
-    if oo.side == "sell":
+    if oo.side == "sell" and getattr(state, "use_tp1_trailing", True):
         try:
             if not oo.simulated and oo.id:
                 exchange.cancel_order(oo.id, SYMBOL)
@@ -664,6 +753,7 @@ def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dic
         lookback = int(getattr(state, "data_lookback", DATA_LOOKBACK_CANDLES_DEFAULT) or DATA_LOOKBACK_CANDLES_DEFAULT)
         k_buy = float(getattr(state, "adaptive_k_buy", ADAPTIVE_PRESETS[ADAPTIVE_PROFILE_DEFAULT]["k_buy"]))
         k_sell = float(getattr(state, "adaptive_k_sell", ADAPTIVE_PRESETS[ADAPTIVE_PROFILE_DEFAULT]["k_sell"]))
+        use_edge = bool(getattr(state, "use_edge_aware_thresholds", USE_EDGE_AWARE_THRESHOLDS_DEFAULT))
 
     if profile in ADAPTIVE_PRESETS and profile != "Custom":
         preset = ADAPTIVE_PRESETS[profile]
@@ -718,6 +808,31 @@ def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dic
     # Convert volatility (per-minute %) into effective thresholds
     raw_buy = max(0.0, blended_v) * k_buy
     raw_sell = max(0.0, blended_v) * k_sell
+
+    # Edge-aware clamp to cover costs (fees + spread + slippage + buffer)
+    if use_edge:
+        fee_pct = max(0.0, TAKER_FEE * 100.0)  # round-trip fee assumed symmetric
+        spread_pct = EDGE_SPREAD_FALLBACK_PCT
+        try:
+            ticker = exchange.fetch_ticker(SYMBOL) or {}
+            bid = float(ticker.get("bid") or 0.0)
+            ask = float(ticker.get("ask") or 0.0)
+            if bid > 0 and ask > 0 and ask > bid:
+                spread_pct = max(spread_pct, (ask - bid) / bid * 100.0)
+        except Exception:
+            pass
+
+        slip_pct = EDGE_SLIPPAGE_FALLBACK_PCT
+        try:
+            slip_bps = float(getattr(state, "last_slippage_bps", 0.0) or 0.0)
+            slip_pct = max(slip_pct, slip_bps / 100.0)
+        except Exception:
+            pass
+
+        min_required_move_pct = (2 * fee_pct) + spread_pct + slip_pct + EDGE_BUFFER_PCT_DEFAULT
+        raw_sell = max(raw_sell, min_required_move_pct)
+        # Optionally clamp buy to avoid noise entries that can't cover costs
+        raw_buy = max(raw_buy, min_required_move_pct * 0.5)
 
     # Apply trend bias (reuse existing multipliers)
     if trend == "UP":
@@ -838,6 +953,9 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
         state.last_trade_side = "SELL"
         state.anchor_timestamp = now_ts
         state.status = "WAIT_DIP"
+        state.dip_wait_start_ts = 0.0
+        state.dip_low = 0.0
+        state.dip_higher_close_count = 0
         buy_trigger = state.last_trade_price * (1 - buy_thr / 100.0)
         state.pending_buy_price = buy_trigger
         log_event(state, f"Initialized. Waiting for dip: BUY trigger at {buy_trigger:.8f}")
@@ -854,6 +972,9 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
         state.last_trade_price = last_price
         state.anchor_timestamp = now_ts
         state.pending_buy_price = None
+        state.dip_wait_start_ts = 0.0
+        state.dip_low = 0.0
+        state.dip_higher_close_count = 0
         log_event(state, f"Re-anchoring BUY reference {old_anchor:.8f} -> {last_price:.8f} (age={0 if age is None else age:.0f}s).")
 
     buy_trigger_price = state.last_trade_price * (1 - buy_thr / 100.0)
@@ -863,9 +984,51 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
         # keep log quieter; comment back in if you want it noisy:
         # log_event(state, f"New BUY trigger set at {buy_trigger_price:.8f} (waiting for dip)")
 
+    use_rebound = bool(getattr(state, "use_dip_rebound", True))
+    rebound_pct = max(0.0, float(getattr(state, "rebound_confirm_pct", REBOUND_CONFIRM_PCT_DEFAULT)))
+    rebound_timeout = max(5.0, float(getattr(state, "dip_rebound_timeout_sec", DIP_REBOUND_TIMEOUT_SEC_DEFAULT)))
+
     if last_price > buy_trigger_price:
         state.status = "WAIT_DIP"
+        state.dip_wait_start_ts = 0.0
+        state.dip_low = 0.0
+        state.dip_higher_close_count = 0
         return
+
+    # Dip reached: wait for bounce confirmation if enabled
+    if use_rebound:
+        if state.dip_wait_start_ts <= 0:
+            state.dip_wait_start_ts = now_ts
+            state.dip_low = last_price
+            state.dip_higher_close_count = 0
+            log_event(state, f"Dip hit {last_price:.8f}. Waiting for bounce to confirm BUY.")
+        else:
+            state.dip_low = min(state.dip_low if state.dip_low > 0 else last_price, last_price)
+
+        # Track consecutive higher closes
+        if len(df) >= 2:
+            prev_close = float(df.iloc[-2]["close"])
+            if last_price > prev_close:
+                state.dip_higher_close_count += 1
+            elif last_price < prev_close:
+                state.dip_higher_close_count = 0
+                state.dip_low = min(state.dip_low, last_price)
+
+        rebound_ok = False
+        if state.dip_low > 0 and last_price >= state.dip_low * (1 + rebound_pct / 100.0):
+            rebound_ok = True
+        if state.dip_higher_close_count >= 2:
+            rebound_ok = True
+
+        timeout_hit = (now_ts - state.dip_wait_start_ts) >= rebound_timeout
+
+        if not rebound_ok and not timeout_hit:
+            state.status = "WAIT_BOUNCE"
+            return
+        # proceed; clear counters
+        state.dip_wait_start_ts = 0.0
+        state.dip_low = 0.0
+        state.dip_higher_close_count = 0
 
     # size
     if DRY_RUN:
@@ -902,6 +1065,9 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
         state.last_trade_side = "BUY"
         state.anchor_timestamp = time.time()
         state.pending_buy_price = None
+        state.dip_wait_start_ts = 0.0
+        state.dip_low = 0.0
+        state.dip_higher_close_count = 0
         log_event(state, f"Entered position (market) @ {pos.entry_price:.8f}, qty={pos.qty:.6f}")
     else:
         if state.open_order and state.open_order.status == "open" and state.open_order.side == "buy":
@@ -912,6 +1078,9 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
         if oo:
             state.open_order = oo
             state.next_trade_time = time.time() + POLL_INTERVAL_SECONDS
+            state.dip_wait_start_ts = 0.0
+            state.dip_low = 0.0
+            state.dip_higher_close_count = 0
 
 
 def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
@@ -923,9 +1092,97 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     last_price = float(last_row["close"])
     sell_thr = (state.effective_sell_threshold_pct if state.data_driven else state.sell_threshold_pct)
 
+    use_trailing = bool(getattr(state, "use_tp1_trailing", True))
+    use_soft_stop = bool(getattr(state, "use_soft_stop", True))
+    soft_confirms = max(1, int(getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)))
+    hard_stop_mult = max(1.0, float(HARD_STOP_MULT_DEFAULT))
     anchor_price = state.last_trade_price if state.last_trade_price is not None else position.entry_price
     sell_trigger = anchor_price * (1 + sell_thr / 100.0)
     tp1_fraction = max(0.3, min(TP1_SELL_FRACTION, 0.6))
+
+    # Legacy: single full take-profit with optional stop-loss/daily guardrails.
+    if not use_trailing:
+        if state.order_mode == "limit":
+            if state.open_order and state.open_order.status == "open" and state.open_order.side == "sell":
+                return
+            if last_price >= sell_trigger:
+                now = dt.datetime.now(dt.timezone.utc)
+                oo = place_limit_sell(exchange, state, position, last_price, now)
+                if oo:
+                    state.open_order = oo
+                    state.pending_sell_price = last_price
+            return
+
+        full_exit = False
+        reason = None
+
+        if last_price >= sell_trigger:
+            full_exit = True
+            reason = "take_profit_threshold"
+
+        if (not full_exit) and (STOP_LOSS_PCT is not None):
+            stop_price = position.entry_price * (1 - STOP_LOSS_PCT / 100.0)
+            hard_stop_price = position.entry_price * (1 - (STOP_LOSS_PCT * hard_stop_mult) / 100.0)
+
+            if last_price > stop_price:
+                state.soft_stop_counter = 0
+
+            if last_price <= hard_stop_price:
+                full_exit = True
+                reason = "hard_stop"
+                state.soft_stop_counter = 0
+            elif use_soft_stop:
+                if last_price <= stop_price:
+                    state.soft_stop_counter = min(soft_confirms, state.soft_stop_counter + 1)
+                    if state.soft_stop_counter >= soft_confirms:
+                        full_exit = True
+                        reason = "soft_stop"
+                        state.soft_stop_counter = 0
+                else:
+                    state.soft_stop_counter = 0
+            else:
+                if last_price <= stop_price:
+                    full_exit = True
+                    reason = "stop_loss"
+                    state.soft_stop_counter = 0
+        else:
+            state.soft_stop_counter = 0
+
+        if (not full_exit) and (
+            state.daily_realized_pnl <= DAILY_MAX_LOSS_USDT or state.daily_realized_pnl >= DAILY_MAX_PROFIT_USDT
+        ):
+            full_exit = True
+            reason = "daily_limit"
+
+        if full_exit and position.qty > 0:
+            qty_exit = position.qty
+            filled_qty, exit_price = place_market_sell(exchange, state, position, qty_exit, last_price)
+            if filled_qty > 0:
+                pnl = realize_pnl_for_exit(state, position, filled_qty, exit_price)
+                state.daily_realized_pnl += pnl
+
+                if reason == "stop_loss":
+                    now_ts = time.time()
+                    state.stop_loss_timestamps.append(now_ts)
+                    while state.stop_loss_timestamps and now_ts - state.stop_loss_timestamps[0] > 3600:
+                        state.stop_loss_timestamps.popleft()
+                    if len(state.stop_loss_timestamps) >= MAX_STOPS_PER_HOUR:
+                        state.trading_paused_until = now_ts + CIRCUIT_STOP_COOLDOWN_SEC
+                        state.paused_reason = "Too many stop losses in last hour"
+                        log_event(state, "Circuit breaker: too many stop losses. Pausing trading.")
+
+                position.last_exit_reason = reason
+                log_event(state, f"Exited position @ {exit_price:.8f} (reason: {reason}), PnL: {pnl:.2f} USDT")
+
+            state.position = None
+            state.status = "WAIT_DIP"
+            state.next_trade_time = time.time() + POLL_INTERVAL_SECONDS
+            state.last_trade_price = exit_price
+            state.last_trade_side = "SELL"
+            state.anchor_timestamp = time.time()
+            state.pending_sell_price = None
+            state.open_order = None
+        return
 
     if getattr(position, "peak_price", 0.0) <= 0:
         position.peak_price = position.entry_price
@@ -959,6 +1216,7 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
         state.anchor_timestamp = time.time()
         state.pending_sell_price = None
         state.open_order = None
+        state.soft_stop_counter = 0
 
     def _record_stop_loss_timestamp():
         now_ts = time.time()
@@ -982,7 +1240,7 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
         pnl = realize_pnl_for_exit(state, position, filled_qty, exit_price)
         state.daily_realized_pnl += pnl
 
-        if reason == "stop_loss":
+        if reason in ("stop_loss", "soft_stop", "hard_stop"):
             _record_stop_loss_timestamp()
 
         position.last_exit_reason = reason
@@ -1000,10 +1258,35 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     # Forced exits first (risk limits)
     if STOP_LOSS_PCT is not None:
         stop_price = position.entry_price * (1 - STOP_LOSS_PCT / 100.0)
-        if last_price <= stop_price:
-            closed, _ = _execute_market_exit(position.qty, "stop_loss")
+        hard_stop_price = position.entry_price * (1 - (STOP_LOSS_PCT * hard_stop_mult) / 100.0)
+
+        if last_price > stop_price:
+            state.soft_stop_counter = 0
+
+        if last_price <= hard_stop_price:
+            state.soft_stop_counter = 0
+            closed, _ = _execute_market_exit(position.qty, "hard_stop")
             if closed or state.position is None:
                 return
+        elif use_soft_stop:
+            if last_price <= stop_price:
+                state.soft_stop_counter = min(soft_confirms, state.soft_stop_counter + 1)
+                if state.soft_stop_counter >= soft_confirms:
+                    closed, _ = _execute_market_exit(position.qty, "soft_stop")
+                    state.soft_stop_counter = 0
+                    if closed or state.position is None:
+                        return
+            else:
+                state.soft_stop_counter = 0
+        else:
+            if last_price <= stop_price:
+                state.soft_stop_counter = 0
+                closed, _ = _execute_market_exit(position.qty, "stop_loss")
+                if closed or state.position is None:
+                    return
+
+    else:
+        state.soft_stop_counter = 0
 
     if state.daily_realized_pnl <= DAILY_MAX_LOSS_USDT or state.daily_realized_pnl >= DAILY_MAX_PROFIT_USDT:
         closed, _ = _execute_market_exit(position.qty, "daily_limit")
@@ -1516,8 +1799,10 @@ class BotGUI:
 
         self.tab_trading = ttk.Frame(self.tabs)
         self.tab_adaptive = ttk.Frame(self.tabs)
+        self.tab_toggles = ttk.Frame(self.tabs)
         self.tabs.add(self.tab_trading, text="Trading")
         self.tabs.add(self.tab_adaptive, text="Adaptive")
+        self.tabs.add(self.tab_toggles, text="Toggles")
 
         self._build_status_card(self.tab_trading)
         self._build_api_card(self.tab_trading)
@@ -1525,6 +1810,7 @@ class BotGUI:
         self._build_buttons_card(self.tab_trading)
 
         self._build_adaptive_tab(self.tab_adaptive)
+        self._build_toggles_tab(self.tab_toggles)
 
 
         # --- Chart + info on the right ---
@@ -1903,6 +2189,102 @@ class BotGUI:
             except Exception:
                 pass
 
+    def _build_toggles_tab(self, parent):
+        card = self._card(parent, "Feature Toggles")
+
+        self.tp1_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_tp1_trailing", True)))
+        ttk.Label(card, text="TP1 partial + trailing exit").grid(row=0, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Checkbutton(card, variable=self.tp1_toggle_var, command=self._on_toggle_tp1_trailing).grid(
+            row=0, column=1, sticky="w", padx=8, pady=(4, 2)
+        )
+        ttk.Label(
+            card,
+            text="Disable to revert to single full take-profit exit (still honors SL/daily guards).",
+            wraplength=self.SIDEBAR_WIDTH - 60,
+            justify="left",
+            foreground="#666",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+        self.soft_stop_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_soft_stop", True)))
+        ttk.Label(card, text="Soft stop (confirm) + Hard stop").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 2))
+        ttk.Checkbutton(card, variable=self.soft_stop_toggle_var, command=self._on_toggle_soft_stop).grid(
+            row=2, column=1, sticky="w", padx=8, pady=(8, 2)
+        )
+        ttk.Label(card, text="Soft stop confirms (# closes)").grid(row=3, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.soft_stop_confirms_var = tk.StringVar(value=str(getattr(self.state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)))
+        e_conf = ttk.Entry(card, textvariable=self.soft_stop_confirms_var, width=10)
+        e_conf.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_conf.bind("<Return>", self._on_soft_stop_confirms)
+        e_conf.bind("<FocusOut>", self._on_soft_stop_confirms)
+        ttk.Label(
+            card,
+            text="Soft stop waits for multiple closes under stop to avoid wick-outs; hard stop hits deeper drop immediately.",
+            wraplength=self.SIDEBAR_WIDTH - 60,
+            justify="left",
+            foreground="#666",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+
+        self.dip_rebound_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_dip_rebound", True)))
+        ttk.Label(card, text="Dip → bounce confirmation").grid(row=5, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Checkbutton(card, variable=self.dip_rebound_toggle_var, command=self._on_toggle_dip_rebound).grid(
+            row=5, column=1, sticky="w", padx=8, pady=(4, 2)
+        )
+        ttk.Label(card, text="Rebound confirm %").grid(row=6, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.rebound_confirm_var = tk.StringVar(value=f"{getattr(self.state, 'rebound_confirm_pct', REBOUND_CONFIRM_PCT_DEFAULT):.3f}")
+        e_reb = ttk.Entry(card, textvariable=self.rebound_confirm_var, width=10)
+        e_reb.grid(row=6, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_reb.bind("<Return>", self._on_rebound_confirm_pct)
+        e_reb.bind("<FocusOut>", self._on_rebound_confirm_pct)
+
+        ttk.Label(card, text="Rebound timeout (sec)").grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.rebound_timeout_var = tk.StringVar(value=f"{getattr(self.state, 'dip_rebound_timeout_sec', DIP_REBOUND_TIMEOUT_SEC_DEFAULT):.0f}")
+        e_rt = ttk.Entry(card, textvariable=self.rebound_timeout_var, width=10)
+        e_rt.grid(row=7, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_rt.bind("<Return>", self._on_rebound_timeout)
+        e_rt.bind("<FocusOut>", self._on_rebound_timeout)
+
+        ttk.Label(
+            card,
+            text="Wait for a tiny bounce or 2 higher closes before buying the dip; timeout to avoid waiting forever.",
+            wraplength=self.SIDEBAR_WIDTH - 60,
+            justify="left",
+            foreground="#666",
+        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+
+        self.edge_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_edge_aware_thresholds", USE_EDGE_AWARE_THRESHOLDS_DEFAULT)))
+        ttk.Label(card, text="Edge-aware thresholds").grid(row=9, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Checkbutton(card, variable=self.edge_toggle_var, command=self._on_toggle_edge_aware).grid(
+            row=9, column=1, sticky="w", padx=8, pady=(4, 2)
+        )
+        ttk.Label(
+            card,
+            text="Clamp SELL (and optionally BUY) thresholds to cover fees + spread + slippage + buffer.",
+            wraplength=self.SIDEBAR_WIDTH - 60,
+            justify="left",
+            foreground="#666",
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+
+        self.ioc_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT)))
+        ttk.Label(card, text="IOC with slippage cap").grid(row=11, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Checkbutton(card, variable=self.ioc_toggle_var, command=self._on_toggle_ioc_cap).grid(
+            row=11, column=1, sticky="w", padx=8, pady=(4, 2)
+        )
+        ttk.Label(card, text="Max slip % (over best bid/ask)").grid(row=12, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.max_slip_var = tk.StringVar(value=f"{getattr(self.state, 'max_slip_pct', MAX_SLIP_PCT_DEFAULT):.3f}")
+        e_ms = ttk.Entry(card, textvariable=self.max_slip_var, width=10)
+        e_ms.grid(row=12, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_ms.bind("<Return>", self._on_max_slip_pct)
+        e_ms.bind("<FocusOut>", self._on_max_slip_pct)
+
+        ttk.Label(
+            card,
+            text="Use IOC limits with a slip cap to avoid runaway market fills; retries once, then fallback to market as last resort.",
+            wraplength=self.SIDEBAR_WIDTH - 60,
+            justify="left",
+            foreground="#666",
+        ).grid(row=13, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        card.columnconfigure(1, weight=1)
+
     def _sync_tf_selection(self, tfs: List[str]):
         try:
             self.tf_list.selection_clear(0, "end")
@@ -2208,6 +2590,94 @@ class BotGUI:
         want = bool(self.dry_run_var.get())
         self.cmd_queue.put(f"dry_run:{1 if want else 0}")
 
+    def _on_toggle_tp1_trailing(self):
+        want = bool(self.tp1_toggle_var.get())
+        with self.state.lock:
+            self.state.use_tp1_trailing = want
+        save_settings(self.state)
+        log_event(self.state, f"TP1 + trailing exits {'ENABLED' if want else 'DISABLED'}")
+
+    def _on_toggle_soft_stop(self):
+        want = bool(self.soft_stop_toggle_var.get())
+        with self.state.lock:
+            self.state.use_soft_stop = want
+            self.state.soft_stop_counter = 0
+        save_settings(self.state)
+        log_event(self.state, f"Soft stop {'ENABLED' if want else 'DISABLED'} (hard stop always active when SL set)")
+
+    def _on_soft_stop_confirms(self, event=None):
+        raw = self.soft_stop_confirms_var.get().strip()
+        try:
+            v = max(1, int(float(raw)))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.soft_stop_confirms = v
+            self.state.soft_stop_counter = 0
+        self.soft_stop_confirms_var.set(str(v))
+        save_settings(self.state)
+        log_event(self.state, f"Soft stop confirms set to {v} closes below stop")
+
+    def _on_toggle_dip_rebound(self):
+        want = bool(self.dip_rebound_toggle_var.get())
+        with self.state.lock:
+            self.state.use_dip_rebound = want
+            self.state.dip_wait_start_ts = 0.0
+            self.state.dip_low = 0.0
+            self.state.dip_higher_close_count = 0
+        save_settings(self.state)
+        log_event(self.state, f"Dip rebound confirmation {'ENABLED' if want else 'DISABLED'}")
+
+    def _on_rebound_confirm_pct(self, event=None):
+        raw = self.rebound_confirm_var.get().strip()
+        try:
+            v = max(0.0, float(raw))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.rebound_confirm_pct = v
+        self.rebound_confirm_var.set(f"{v:.3f}")
+        save_settings(self.state)
+        log_event(self.state, f"Rebound confirm set to {v:.3f}%")
+
+    def _on_rebound_timeout(self, event=None):
+        raw = self.rebound_timeout_var.get().strip()
+        try:
+            v = max(5.0, float(raw))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.dip_rebound_timeout_sec = v
+        self.rebound_timeout_var.set(f"{v:.0f}")
+        save_settings(self.state)
+        log_event(self.state, f"Rebound timeout set to {v:.0f}s")
+
+    def _on_toggle_edge_aware(self):
+        want = bool(self.edge_toggle_var.get())
+        with self.state.lock:
+            self.state.use_edge_aware_thresholds = want
+        save_settings(self.state)
+        log_event(self.state, f"Edge-aware thresholds {'ENABLED' if want else 'DISABLED'}")
+
+    def _on_toggle_ioc_cap(self):
+        want = bool(self.ioc_toggle_var.get())
+        with self.state.lock:
+            self.state.use_ioc_slippage_cap = want
+        save_settings(self.state)
+        log_event(self.state, f"IOC slippage cap {'ENABLED' if want else 'DISABLED'}")
+
+    def _on_max_slip_pct(self, event=None):
+        raw = self.max_slip_var.get().strip()
+        try:
+            v = max(0.01, float(raw))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.max_slip_pct = v
+        self.max_slip_var.set(f"{v:.3f}")
+        save_settings(self.state)
+        log_event(self.state, f"Max slip pct set to {v:.3f}%")
+
 
     def on_buy_threshold_change(self, value: str):
         try:
@@ -2448,6 +2918,10 @@ class BotGUI:
             data_tf = s.data_timeframe
             profile = getattr(s, 'adaptive_profile', ADAPTIVE_PROFILE_DEFAULT)
             tfs = list(getattr(s, 'adaptive_timeframes', []) or [])
+            use_tp1_trailing = bool(getattr(s, "use_tp1_trailing", True))
+            use_dip_rebound = bool(getattr(s, "use_dip_rebound", True))
+            use_edge = bool(getattr(s, "use_edge_aware_thresholds", USE_EDGE_AWARE_THRESHOLDS_DEFAULT))
+            use_ioc_cap = bool(getattr(s, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
             buy_thr = eff_buy if data_driven else s.buy_threshold_pct
             sell_thr = eff_sell if data_driven else s.sell_threshold_pct
             pending_buy_price = s.pending_buy_price
@@ -2481,6 +2955,51 @@ class BotGUI:
                     self.slippage_var.set(f"{slip_side} {slip_bps:.1f} bps")
             else:
                 self.slippage_var.set("-")
+            if hasattr(self, "tp1_toggle_var"):
+                try:
+                    self.tp1_toggle_var.set(bool(use_tp1_trailing))
+                except Exception:
+                    pass
+            if hasattr(self, "soft_stop_toggle_var"):
+                try:
+                    self.soft_stop_toggle_var.set(bool(getattr(s, "use_soft_stop", True)))
+                except Exception:
+                    pass
+            if hasattr(self, "soft_stop_confirms_var"):
+                try:
+                    self.soft_stop_confirms_var.set(str(int(getattr(s, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT))))
+                except Exception:
+                    pass
+            if hasattr(self, "dip_rebound_toggle_var"):
+                try:
+                    self.dip_rebound_toggle_var.set(bool(use_dip_rebound))
+                except Exception:
+                    pass
+            if hasattr(self, "rebound_confirm_var"):
+                try:
+                    self.rebound_confirm_var.set(f"{float(getattr(s, 'rebound_confirm_pct', REBOUND_CONFIRM_PCT_DEFAULT)):.3f}")
+                except Exception:
+                    pass
+            if hasattr(self, "rebound_timeout_var"):
+                try:
+                    self.rebound_timeout_var.set(f"{float(getattr(s, 'dip_rebound_timeout_sec', DIP_REBOUND_TIMEOUT_SEC_DEFAULT)):.0f}")
+                except Exception:
+                    pass
+            if hasattr(self, "edge_toggle_var"):
+                try:
+                    self.edge_toggle_var.set(bool(use_edge))
+                except Exception:
+                    pass
+            if hasattr(self, "ioc_toggle_var"):
+                try:
+                    self.ioc_toggle_var.set(bool(use_ioc_cap))
+                except Exception:
+                    pass
+            if hasattr(self, "max_slip_var"):
+                try:
+                    self.max_slip_var.set(f"{float(getattr(s, 'max_slip_pct', MAX_SLIP_PCT_DEFAULT)):.3f}")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2649,6 +3168,36 @@ def run_bot():
             elif "MANUAL_SELL_PCT" in settings:
                 # backward-compat from older settings files
                 state.manual_sell_pct = float(settings["MANUAL_SELL_PCT"])
+            if "use_tp1_trailing" in settings:
+                state.use_tp1_trailing = bool(settings["use_tp1_trailing"])
+            if "use_soft_stop" in settings:
+                state.use_soft_stop = bool(settings["use_soft_stop"])
+            if "soft_stop_confirms" in settings:
+                try:
+                    state.soft_stop_confirms = max(1, int(settings["soft_stop_confirms"]))
+                except Exception:
+                    state.soft_stop_confirms = config.SOFT_STOP_CONFIRMS_DEFAULT
+            if "use_dip_rebound" in settings:
+                state.use_dip_rebound = bool(settings["use_dip_rebound"])
+            if "rebound_confirm_pct" in settings:
+                try:
+                    state.rebound_confirm_pct = max(0.0, float(settings["rebound_confirm_pct"]))
+                except Exception:
+                    state.rebound_confirm_pct = config.REBOUND_CONFIRM_PCT_DEFAULT
+            if "dip_rebound_timeout_sec" in settings:
+                try:
+                    state.dip_rebound_timeout_sec = max(5.0, float(settings["dip_rebound_timeout_sec"]))
+                except Exception:
+                    state.dip_rebound_timeout_sec = config.DIP_REBOUND_TIMEOUT_SEC_DEFAULT
+            if "use_edge_aware_thresholds" in settings:
+                state.use_edge_aware_thresholds = bool(settings["use_edge_aware_thresholds"])
+            if "use_ioc_slippage_cap" in settings:
+                state.use_ioc_slippage_cap = bool(settings["use_ioc_slippage_cap"])
+            if "max_slip_pct" in settings:
+                try:
+                    state.max_slip_pct = max(0.01, float(settings["max_slip_pct"]))
+                except Exception:
+                    state.max_slip_pct = config.MAX_SLIP_PCT_DEFAULT
 
             if "total_realized_pnl" in settings:
                 state.total_realized_pnl = float(settings["total_realized_pnl"])

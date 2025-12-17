@@ -44,6 +44,19 @@ class BotState:
     position: Optional[Position] = None
     sim_balance_usdt: float = config.SIMULATED_BALANCE_USDT
     sim_base_qty: float = 0.0
+    use_tp1_trailing: bool = config.USE_TP1_TRAILING_DEFAULT
+    use_soft_stop: bool = config.USE_SOFT_STOP_DEFAULT
+    soft_stop_confirms: int = config.SOFT_STOP_CONFIRMS_DEFAULT
+    soft_stop_counter: int = 0
+    use_dip_rebound: bool = config.USE_DIP_REBOUND_DEFAULT
+    rebound_confirm_pct: float = config.REBOUND_CONFIRM_PCT_DEFAULT
+    dip_rebound_timeout_sec: float = config.DIP_REBOUND_TIMEOUT_SEC_DEFAULT
+    dip_wait_start_ts: float = 0.0
+    dip_low: float = 0.0
+    dip_higher_close_count: int = 0
+    use_edge_aware_thresholds: bool = config.USE_EDGE_AWARE_THRESHOLDS_DEFAULT
+    use_ioc_slippage_cap: bool = config.USE_IOC_SLIPPAGE_CAP_DEFAULT
+    max_slip_pct: float = config.MAX_SLIP_PCT_DEFAULT
 
     daily_realized_pnl: float = 0.0
     day_start_date: dt.date = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).date())

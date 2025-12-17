@@ -39,6 +39,15 @@ def save_settings(state: BotState) -> None:
                 "auto_buy_pct": float(state.auto_buy_pct),
                 "manual_buy_pct": float(state.manual_buy_pct),
                 "manual_sell_pct": float(getattr(state, "manual_sell_pct", config.MANUAL_SELL_PCT_DEFAULT)),
+                "use_tp1_trailing": bool(getattr(state, "use_tp1_trailing", config.USE_TP1_TRAILING_DEFAULT)),
+                "use_soft_stop": bool(getattr(state, "use_soft_stop", config.USE_SOFT_STOP_DEFAULT)),
+                "soft_stop_confirms": int(getattr(state, "soft_stop_confirms", config.SOFT_STOP_CONFIRMS_DEFAULT)),
+                "use_dip_rebound": bool(getattr(state, "use_dip_rebound", config.USE_DIP_REBOUND_DEFAULT)),
+                "rebound_confirm_pct": float(getattr(state, "rebound_confirm_pct", config.REBOUND_CONFIRM_PCT_DEFAULT)),
+                "dip_rebound_timeout_sec": float(getattr(state, "dip_rebound_timeout_sec", config.DIP_REBOUND_TIMEOUT_SEC_DEFAULT)),
+                "use_edge_aware_thresholds": bool(getattr(state, "use_edge_aware_thresholds", config.USE_EDGE_AWARE_THRESHOLDS_DEFAULT)),
+                "use_ioc_slippage_cap": bool(getattr(state, "use_ioc_slippage_cap", config.USE_IOC_SLIPPAGE_CAP_DEFAULT)),
+                "max_slip_pct": float(getattr(state, "max_slip_pct", config.MAX_SLIP_PCT_DEFAULT)),
 
                 # lifetime stats
                 "total_realized_pnl": float(getattr(state, "total_realized_pnl", 0.0)),

@@ -13,6 +13,29 @@ DRY_RUN = False  # LIVE if you use real keys with trading perms
 SIMULATED_BALANCE_USDT = 100.0
 TAKER_FEE = 0.0015  # 0.15% per side (adjust to your exchange)
 
+# Feature toggles
+USE_TP1_TRAILING_DEFAULT = True   # enable partial TP + trailing exit logic
+USE_SOFT_STOP_DEFAULT = True      # confirm stops with multiple closes unless hard-stop trips
+USE_DIP_REBOUND_DEFAULT = True    # require rebound confirmation before buying the dip
+USE_EDGE_AWARE_THRESHOLDS_DEFAULT = True  # clamp thresholds to cover fees + spread + slippage
+USE_IOC_SLIPPAGE_CAP_DEFAULT = True       # switch market orders to IOC limits with slippage cap
+
+# Soft/Hard stop settings
+SOFT_STOP_CONFIRMS_DEFAULT = 2    # closes below stop before exiting (soft stop)
+HARD_STOP_MULT_DEFAULT = 1.7      # hard-stop triggers at this multiple of stop distance (e.g., 1.7x stop depth)
+
+# Dip-to-bounce entry settings
+REBOUND_CONFIRM_PCT_DEFAULT = 0.15      # % rebound off dip low to confirm entry
+DIP_REBOUND_TIMEOUT_SEC_DEFAULT = 120.0 # max seconds to wait for rebound confirmation
+
+# Edge-aware thresholds
+EDGE_BUFFER_PCT_DEFAULT = 0.05         # extra cushion on top of costs (in %)
+EDGE_SPREAD_FALLBACK_PCT = 0.02        # fallback spread % if ticker spread unavailable
+EDGE_SLIPPAGE_FALLBACK_PCT = 0.05      # fallback slippage % if last slippage unknown
+
+# IOC slippage cap for execution (percent)
+MAX_SLIP_PCT_DEFAULT = 0.60            # 0.60% default cap over best bid/ask for IOC limits
+
 # ---- DRY_RUN slippage simulator (order book based) ----
 # If enabled, DRY_RUN market orders will fill using the live order book depth,
 # which makes PnL closer to reality (spread + depth slippage).
