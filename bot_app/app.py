@@ -257,9 +257,11 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
         symbol=symbol,
         entry_price=fill_price,
         qty=filled_qty,
+        initial_qty=filled_qty,
         entry_time=now,
         entry_index=entry_index,
         entry_fee=entry_fee,
+        peak_price=fill_price,
     )
 
 
@@ -407,7 +409,11 @@ def realize_pnl_for_exit(state: BotState, position: Position, qty_exit: float, e
     if qty_exit <= 0 or position.qty <= 0:
         return 0.0
 
-    qty_ratio = qty_exit / position.qty
+    initial_qty = getattr(position, "initial_qty", position.qty)
+    denom_qty = initial_qty if initial_qty > 0 else position.qty
+    if denom_qty <= 0:
+        denom_qty = qty_exit
+    qty_ratio = min(1.0, max(0.0, qty_exit / denom_qty))
     allocated_entry_fee = position.entry_fee * qty_ratio
 
     exit_value = qty_exit * exit_price
@@ -447,6 +453,18 @@ def check_open_order(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame)
         return
 
     last_row = df.iloc[-1]
+
+    if oo.side == "sell":
+        try:
+            if not oo.simulated and oo.id:
+                exchange.cancel_order(oo.id, SYMBOL)
+        except Exception as e:
+            log_event(state, f"[WARN] Canceling stale SELL limit order failed: {e}")
+        oo.status = "canceled"
+        state.open_order = None
+        state.pending_sell_price = None
+        return
+
     low = float(last_row["low"])
     high = float(last_row["high"])
     last_price = float(last_row["close"])
@@ -469,9 +487,11 @@ def check_open_order(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame)
                     symbol=SYMBOL,
                     entry_price=fill_price,
                     qty=fill_qty,
+                    initial_qty=fill_qty,
                     entry_time=dt.datetime.now(dt.timezone.utc),
                     entry_index=len(df) - 1,
                     entry_fee=fee,
+                    peak_price=fill_price,
                 )
                 state.position = pos
                 state.last_trade_price = fill_price
@@ -520,9 +540,11 @@ def check_open_order(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame)
                 symbol=SYMBOL,
                 entry_price=avg_price,
                 qty=filled_qty,
+                initial_qty=filled_qty,
                 entry_time=dt.datetime.now(dt.timezone.utc),
                 entry_index=len(df) - 1,
                 entry_fee=filled_qty * avg_price * TAKER_FEE,
+                peak_price=avg_price,
             )
             state.position = pos
             state.last_trade_price = avg_price
@@ -901,59 +923,34 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     last_price = float(last_row["close"])
     sell_thr = (state.effective_sell_threshold_pct if state.data_driven else state.sell_threshold_pct)
 
-    sell_trigger = state.last_trade_price * (1 + sell_thr / 100.0)
+    anchor_price = state.last_trade_price if state.last_trade_price is not None else position.entry_price
+    sell_trigger = anchor_price * (1 + sell_thr / 100.0)
+    tp1_fraction = max(0.3, min(TP1_SELL_FRACTION, 0.6))
 
-    if state.order_mode == "limit":
-        if state.open_order and state.open_order.status == "open" and state.open_order.side == "sell":
-            return
-        if last_price >= sell_trigger:
-            now = dt.datetime.now(dt.timezone.utc)
-            oo = place_limit_sell(exchange, state, position, last_price, now)
-            if oo:
-                state.open_order = oo
-                state.pending_sell_price = last_price
-        return
+    if getattr(position, "peak_price", 0.0) <= 0:
+        position.peak_price = position.entry_price
+    position.peak_price = max(position.peak_price, last_price)
 
-    # market exits
-    full_exit = False
-    reason = None
+    def _compute_trail_pct() -> float:
+        trail = max(TRAIL_STOP_PCT, sell_thr * 0.5)
+        atr_pct = float(getattr(state, "blended_atr_per_min_pct", 0.0) or 0.0)
+        if TRAIL_ATR_MULT and atr_pct > 0:
+            trail = max(trail, atr_pct * TRAIL_ATR_MULT)
+        return max(trail, 0.0)
 
-    if last_price >= sell_trigger:
-        full_exit = True
-        reason = "take_profit_threshold"
+    def _cancel_open_sell_if_any():
+        oo = state.open_order
+        if oo and oo.status == "open" and oo.side == "sell":
+            try:
+                if not oo.simulated and oo.id:
+                    exchange.cancel_order(oo.id, SYMBOL)
+            except Exception as e:
+                log_event(state, f"[WARN] Failed to cancel open SELL limit: {e}")
+            oo.status = "canceled"
+            state.open_order = None
+            state.pending_sell_price = None
 
-    if (not full_exit) and (STOP_LOSS_PCT is not None):
-        stop_price = position.entry_price * (1 - STOP_LOSS_PCT / 100.0)
-        if last_price <= stop_price:
-            full_exit = True
-            reason = "stop_loss"
-
-    if (not full_exit) and (
-        state.daily_realized_pnl <= DAILY_MAX_LOSS_USDT or state.daily_realized_pnl >= DAILY_MAX_PROFIT_USDT
-    ):
-        full_exit = True
-        reason = "daily_limit"
-
-    if full_exit and position.qty > 0:
-        qty_exit = position.qty
-        filled_qty, exit_price = place_market_sell(exchange, state, position, qty_exit, last_price)
-        if filled_qty > 0:
-            pnl = realize_pnl_for_exit(state, position, filled_qty, exit_price)
-            state.daily_realized_pnl += pnl
-
-            if reason == "stop_loss":
-                now_ts = time.time()
-                state.stop_loss_timestamps.append(now_ts)
-                while state.stop_loss_timestamps and now_ts - state.stop_loss_timestamps[0] > 3600:
-                    state.stop_loss_timestamps.popleft()
-                if len(state.stop_loss_timestamps) >= MAX_STOPS_PER_HOUR:
-                    state.trading_paused_until = now_ts + CIRCUIT_STOP_COOLDOWN_SEC
-                    state.paused_reason = "Too many stop losses in last hour"
-                    log_event(state, "Circuit breaker: too many stop losses. Pausing trading.")
-
-            position.last_exit_reason = reason
-            log_event(state, f"Exited position @ {exit_price:.8f} (reason: {reason}), PnL: {pnl:.2f} USDT")
-
+    def _finalize_close(exit_price: float, reason: str):
         state.position = None
         state.status = "WAIT_DIP"
         state.next_trade_time = time.time() + POLL_INTERVAL_SECONDS
@@ -961,6 +958,81 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
         state.last_trade_side = "SELL"
         state.anchor_timestamp = time.time()
         state.pending_sell_price = None
+        state.open_order = None
+
+    def _record_stop_loss_timestamp():
+        now_ts = time.time()
+        state.stop_loss_timestamps.append(now_ts)
+        while state.stop_loss_timestamps and now_ts - state.stop_loss_timestamps[0] > 3600:
+            state.stop_loss_timestamps.popleft()
+        if len(state.stop_loss_timestamps) >= MAX_STOPS_PER_HOUR:
+            state.trading_paused_until = now_ts + CIRCUIT_STOP_COOLDOWN_SEC
+            state.paused_reason = "Too many stop losses in last hour"
+            log_event(state, "Circuit breaker: too many stop losses. Pausing trading.")
+
+    def _execute_market_exit(qty_exit: float, reason: str) -> Tuple[bool, float]:
+        if qty_exit <= 0 or position.qty <= 0:
+            return False, 0.0
+
+        _cancel_open_sell_if_any()
+        filled_qty, exit_price = place_market_sell(exchange, state, position, qty_exit, last_price)
+        if filled_qty <= 0:
+            return False, 0.0
+
+        pnl = realize_pnl_for_exit(state, position, filled_qty, exit_price)
+        state.daily_realized_pnl += pnl
+
+        if reason == "stop_loss":
+            _record_stop_loss_timestamp()
+
+        position.last_exit_reason = reason
+        remaining_qty = position.qty
+
+        if remaining_qty > 0:
+            log_event(state, f"Partial exit ({reason}) {filled_qty:.6f} @ {exit_price:.8f}, remaining={remaining_qty:.6f}, PnL: {pnl:.2f} USDT")
+            position.peak_price = max(position.peak_price, exit_price, last_price)
+            return False, filled_qty
+
+        log_event(state, f"Exited position @ {exit_price:.8f} (reason: {reason}), PnL: {pnl:.2f} USDT")
+        _finalize_close(exit_price, reason)
+        return True, filled_qty
+
+    # Forced exits first (risk limits)
+    if STOP_LOSS_PCT is not None:
+        stop_price = position.entry_price * (1 - STOP_LOSS_PCT / 100.0)
+        if last_price <= stop_price:
+            closed, _ = _execute_market_exit(position.qty, "stop_loss")
+            if closed or state.position is None:
+                return
+
+    if state.daily_realized_pnl <= DAILY_MAX_LOSS_USDT or state.daily_realized_pnl >= DAILY_MAX_PROFIT_USDT:
+        closed, _ = _execute_market_exit(position.qty, "daily_limit")
+        if closed or state.position is None:
+            return
+
+    # Take-profit 1: partial exit
+    if (not position.tp1_done) and last_price >= sell_trigger:
+        qty_exit = position.qty * tp1_fraction
+        min_qty = MIN_NOTIONAL_USDT / max(last_price, 1e-9)
+        if qty_exit < min_qty:
+            qty_exit = min(position.qty, max(min_qty, qty_exit))
+
+        closed, filled_qty = _execute_market_exit(qty_exit, "tp1_partial")
+        if state.position is None or closed:
+            return
+        if filled_qty > 0:
+            position.tp1_done = True
+            position.peak_price = max(position.peak_price, last_price)
+
+    # Trailing stop on the remainder
+    if position.tp1_done and position.qty > 0:
+        position.peak_price = max(position.peak_price, last_price)
+        trail_stop_price = position.peak_price * (1 - _compute_trail_pct() / 100.0)
+        trail_stop_price = max(trail_stop_price, position.entry_price)
+        if last_price <= trail_stop_price:
+            closed, _ = _execute_market_exit(position.qty, "trailing_stop")
+            if closed or state.position is None:
+                return
 
 
 # ============================================================
@@ -1039,7 +1111,16 @@ def adopt_position_from_wallet(state: BotState, last_price: float):
 
     if state.position is None:
         now = dt.datetime.now(dt.timezone.utc)
-        pos = Position(symbol=SYMBOL, entry_price=last_price, qty=qty_wallet, entry_time=now, entry_index=-1, entry_fee=0.0)
+        pos = Position(
+            symbol=SYMBOL,
+            entry_price=last_price,
+            qty=qty_wallet,
+            initial_qty=qty_wallet,
+            entry_time=now,
+            entry_index=-1,
+            entry_fee=0.0,
+            peak_price=last_price,
+        )
         state.position = pos
         state.last_trade_price = last_price
         state.last_trade_side = "BUY"
@@ -1050,6 +1131,7 @@ def adopt_position_from_wallet(state: BotState, last_price: float):
         if abs(state.position.qty - qty_wallet) > max(min_qty * 0.1, qty_wallet * 0.01):
             log_event(state, f"Adjusting position qty {state.position.qty:.6f} -> {qty_wallet:.6f} {base_asset} to match wallet.")
             state.position.qty = qty_wallet
+            state.position.initial_qty = max(getattr(state.position, "initial_qty", qty_wallet), qty_wallet)
 
 
 # ============================================================

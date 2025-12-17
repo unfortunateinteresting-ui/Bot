@@ -13,11 +13,14 @@ class Position:
     symbol: str
     entry_price: float
     qty: float
+    initial_qty: float
     entry_time: dt.datetime
     entry_index: int
     realized_pnl: float = 0.0
     entry_fee: float = 0.0
     last_exit_reason: Optional[str] = None
+    tp1_done: bool = False
+    peak_price: float = 0.0
 
 
 @dataclass

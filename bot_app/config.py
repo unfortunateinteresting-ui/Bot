@@ -24,6 +24,11 @@ BUY_THRESHOLD_PCT_DEFAULT = 1.0   # % dip below anchor to trigger BUY
 SELL_THRESHOLD_PCT_DEFAULT = 1.0  # % pump above anchor to trigger SELL
 STOP_LOSS_PCT = None              # e.g. 5.0 for 5% SL; None = disabled
 
+# Partial take-profit + trailing stop
+TP1_SELL_FRACTION = 0.50          # fraction of position to sell on first TP (0.30 - 0.60 recommended)
+TRAIL_STOP_PCT = 0.80             # % giveback from peak (post-TP1) that triggers exit of remainder
+TRAIL_ATR_MULT = 1.5              # optional: widen trail using blended ATR% per minute * this multiplier
+
 ANCHOR_MAX_AGE_SEC = 3600         # after 1h, re-anchor to latest price
 ANCHOR_DRIFT_REARM_PCT = 2.0      # or if price drifts >2% above anchor
 
