@@ -53,7 +53,7 @@ from bot_app.exchange_utils import (
     simulate_dry_run_market_fill,
 )
 from bot_app.settings_io import load_settings, save_settings
-from bot_app.state import BotState, OpenOrder, Position, log_event
+from bot_app.state import AutopilotParam, BotState, OpenOrder, Position, log_event
 
 
 
@@ -145,6 +145,40 @@ def simulate_dry_run_market_fill(exchange: ccxt.Exchange, symbol: str, side: str
         return qty_base, price_fallback, price_fallback, price_fallback, 0
 
 
+def normalize_qty_for_market(exchange: ccxt.Exchange, price: float, qty: float) -> Tuple[float, float, float]:
+    """Round qty to market precision and return (qty, min_qty, min_notional)."""
+    market = {}
+    try:
+        market = exchange.markets.get(SYMBOL, {}) if hasattr(exchange, "markets") else {}
+    except Exception:
+        market = {}
+
+    prec = None
+    try:
+        prec = market.get("precision", {}).get("amount")
+    except Exception:
+        prec = None
+
+    if prec is not None:
+        try:
+            qty = float(round(qty, int(prec)))
+        except Exception:
+            pass
+
+    limits = market.get("limits", {}) if isinstance(market, dict) else {}
+    amount_min = None
+    cost_min = None
+    try:
+        amount_min = limits.get("amount", {}).get("min")
+        cost_min = limits.get("cost", {}).get("min")
+    except Exception:
+        pass
+
+    min_notional = max(MIN_NOTIONAL_USDT, float(cost_min) if cost_min else MIN_NOTIONAL_USDT)
+    min_qty = float(amount_min) if amount_min else (min_notional / max(price, 1e-9))
+    return qty, min_qty, min_notional
+
+
 def fetch_best_book_price(exchange: ccxt.Exchange, symbol: str, side: str, price_fallback: float) -> float:
     """Best available price just before a market order.
 
@@ -176,11 +210,30 @@ def fetch_best_book_price(exchange: ccxt.Exchange, symbol: str, side: str, price
         return float(price_fallback)
 
 
+def _get_ap(state: BotState, key: str, default: float) -> AutopilotParam:
+    ap = state.autopilot.get(key)
+    if not ap:
+        ap = AutopilotParam(manual=default, auto=default, effective=default, mode="manual")
+        state.autopilot[key] = ap
+    return ap
+
+
+def _ap_mode(state: BotState, key: str) -> str:
+    try:
+        return _get_ap(state, key, 0.0).mode
+    except Exception:
+        return "manual"
+
+
 def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price_estimate: float,
                      now: dt.datetime, entry_index: int) -> Optional[Position]:
     if qty <= 0:
         return None
     symbol = SYMBOL
+    qty, min_qty, min_notional = normalize_qty_for_market(exchange, price_estimate, qty)
+    if qty <= 0 or qty < min_qty or qty * price_estimate < min_notional:
+        log_event(state, f"BUY skipped: qty {qty:.8f} below min (min_qty≈{min_qty:.8f}, min_notional={min_notional:.2f}).")
+        return None
     use_cap = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
     max_slip_pct = max(0.01, float(getattr(state, "max_slip_pct", MAX_SLIP_PCT_DEFAULT)))
     best_pre = fetch_best_book_price(exchange, symbol, "buy", price_estimate)
@@ -305,6 +358,11 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
         entry_index=entry_index,
         entry_fee=entry_fee,
         peak_price=fill_price,
+        trail_armed=False,
+        trail_pct_used=float(getattr(state, "effective_trail_pct", TRAIL_STOP_PCT)),
+        stop_pct_used=float(getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT)) if (getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT) is not None) else None,
+        hard_stop_mult_used=float(getattr(state, "effective_hard_stop_mult", HARD_STOP_MULT_DEFAULT)),
+        soft_confirms_used=int(getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)),
     )
 
 
@@ -312,10 +370,13 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
                       price_estimate: float) -> Tuple[float, float]:
     if qty_exit <= 0:
         return 0.0, price_estimate
-
     symbol = position.symbol
     use_cap = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
     max_slip_pct = max(0.01, float(getattr(state, "max_slip_pct", MAX_SLIP_PCT_DEFAULT)))
+    qty_exit, min_qty, min_notional = normalize_qty_for_market(exchange, price_estimate, qty_exit)
+    if qty_exit <= 0:
+        log_event(state, f"[WARN] Market SELL skipped: qty normalized to 0 (min_qty≈{min_qty:.8f}).")
+        return 0.0, price_estimate
 
     if DRY_RUN:
         if SIMULATE_SLIPPAGE_DRY_RUN:
@@ -376,6 +437,8 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
         return 0.0, price_estimate
 
     qty_to_sell = min(qty_exit, free_base) * 0.999  # safety margin
+    if qty_to_sell * price_estimate < min_notional and qty_exit < free_base:
+        qty_to_sell = min(free_base, max(qty_to_sell, min_qty))
     if qty_to_sell <= 0:
         log_event(state, "[WARN] Market SELL skipped: quantity <= 0 after safety margin.")
         return 0.0, price_estimate
@@ -449,6 +512,10 @@ def place_limit_buy(exchange: ccxt.Exchange, state: BotState, price: float, usdt
     if usdt_to_spend <= 0 or price <= 0:
         return None
     qty = usdt_to_spend / price
+    qty, min_qty, min_notional = normalize_qty_for_market(exchange, price, qty)
+    if qty <= 0 or qty < min_qty or qty * price < min_notional:
+        log_event(state, f"LIMIT BUY skipped: qty {qty:.8f} below min (min_qty≈{min_qty:.8f}, min_notional={min_notional:.2f}).")
+        return None
     if qty <= 0:
         return None
     symbol = SYMBOL
@@ -476,6 +543,10 @@ def place_limit_sell(exchange: ccxt.Exchange, state: BotState, position: Positio
     if qty_exit <= 0 or price <= 0:
         return None
     symbol = position.symbol
+    qty_exit, min_qty, min_notional = normalize_qty_for_market(exchange, price, qty_exit)
+    if qty_exit <= 0 or qty_exit < min_qty or qty_exit * price < min_notional:
+        log_event(state, f"LIMIT SELL skipped: qty {qty_exit:.8f} below min (min_qty≈{min_qty:.8f}, min_notional={min_notional:.2f}).")
+        return None
 
     if DRY_RUN:
         log_event(state, f"LIMIT SELL (DRY_RUN) {qty_exit:.6f} {symbol.split('/')[0]} @ {price:.8f} - waiting to fill")
@@ -581,6 +652,11 @@ def check_open_order(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame)
                     entry_index=len(df) - 1,
                     entry_fee=fee,
                     peak_price=fill_price,
+                    trail_armed=False,
+                    trail_pct_used=float(getattr(state, "effective_trail_pct", TRAIL_STOP_PCT)),
+                    stop_pct_used=float(getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT)) if (getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT) is not None) else None,
+                    hard_stop_mult_used=float(getattr(state, "effective_hard_stop_mult", HARD_STOP_MULT_DEFAULT)),
+                    soft_confirms_used=int(getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)),
                 )
                 state.position = pos
                 state.last_trade_price = fill_price
@@ -634,6 +710,11 @@ def check_open_order(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame)
                 entry_index=len(df) - 1,
                 entry_fee=filled_qty * avg_price * TAKER_FEE,
                 peak_price=avg_price,
+                trail_armed=False,
+                trail_pct_used=float(getattr(state, "effective_trail_pct", TRAIL_STOP_PCT)),
+                stop_pct_used=float(getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT)) if (getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT) is not None) else None,
+                hard_stop_mult_used=float(getattr(state, "effective_hard_stop_mult", HARD_STOP_MULT_DEFAULT)),
+                soft_confirms_used=int(getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)),
             )
             state.position = pos
             state.last_trade_price = avg_price
@@ -810,28 +891,28 @@ def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dic
     raw_sell = max(0.0, blended_v) * k_sell
 
     # Edge-aware clamp to cover costs (fees + spread + slippage + buffer)
+    fee_bps = max(0.0, TAKER_FEE * 10000.0)
+    spread_pct = EDGE_SPREAD_FALLBACK_PCT
+    try:
+        ticker = exchange.fetch_ticker(SYMBOL) or {}
+        bid = float(ticker.get("bid") or 0.0)
+        ask = float(ticker.get("ask") or 0.0)
+        if bid > 0 and ask > 0 and ask > bid:
+            spread_pct = max(spread_pct, (ask - bid) / bid * 100.0)
+    except Exception:
+        pass
+
+    slip_pct = EDGE_SLIPPAGE_FALLBACK_PCT
+    try:
+        slip_bps = float(getattr(state, "last_slippage_bps", 0.0) or 0.0)
+        slip_pct = max(slip_pct, slip_bps / 100.0)
+    except Exception:
+        pass
+
     if use_edge:
-        fee_pct = max(0.0, TAKER_FEE * 100.0)  # round-trip fee assumed symmetric
-        spread_pct = EDGE_SPREAD_FALLBACK_PCT
-        try:
-            ticker = exchange.fetch_ticker(SYMBOL) or {}
-            bid = float(ticker.get("bid") or 0.0)
-            ask = float(ticker.get("ask") or 0.0)
-            if bid > 0 and ask > 0 and ask > bid:
-                spread_pct = max(spread_pct, (ask - bid) / bid * 100.0)
-        except Exception:
-            pass
-
-        slip_pct = EDGE_SLIPPAGE_FALLBACK_PCT
-        try:
-            slip_bps = float(getattr(state, "last_slippage_bps", 0.0) or 0.0)
-            slip_pct = max(slip_pct, slip_bps / 100.0)
-        except Exception:
-            pass
-
-        min_required_move_pct = (2 * fee_pct) + spread_pct + slip_pct + EDGE_BUFFER_PCT_DEFAULT
+        required_edge_bps = (2 * fee_bps) + (spread_pct * 100.0) + (2 * slip_pct * 100.0) + (EDGE_BUFFER_PCT_DEFAULT * 100.0)
+        min_required_move_pct = required_edge_bps / 100.0
         raw_sell = max(raw_sell, min_required_move_pct)
-        # Optionally clamp buy to avoid noise entries that can't cover costs
         raw_buy = max(raw_buy, min_required_move_pct * 0.5)
 
     # Apply trend bias (reuse existing multipliers)
@@ -859,6 +940,133 @@ def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dic
         "k_buy": k_buy,
         "k_sell": k_sell,
     }
+
+
+def _rate_limit(current: float, target: float, step: float) -> float:
+    if step <= 0:
+        return target
+    if target > current:
+        return min(target, current + step)
+    if target < current:
+        return max(target, current - step)
+    return current
+
+
+def maybe_update_autopilot(exchange: ccxt.Exchange, state: BotState, last_price: float, new_candle: bool) -> None:
+    """Update autopilot auto/effective values on new candles; respects modes and locks."""
+    if not new_candle or last_price <= 0:
+        return
+
+    now_ts = time.time()
+    vol = float(getattr(state, "blended_atr_per_min_pct", 0.0) or 0.0)
+    trend = str(getattr(state, "data_trend", "SIDE") or "SIDE")
+
+    # Spread estimate
+    spread_pct = EDGE_SPREAD_FALLBACK_PCT
+    try:
+        ticker = exchange.fetch_ticker(SYMBOL) or {}
+        bid = float(ticker.get("bid") or 0.0)
+        ask = float(ticker.get("ask") or 0.0)
+        if bid > 0 and ask > 0 and ask > bid:
+            spread_pct = max(spread_pct, (ask - bid) / bid * 100.0)
+    except Exception:
+        pass
+
+    slip_pct = EDGE_SLIPPAGE_FALLBACK_PCT
+    try:
+        slip_bps = float(getattr(state, "last_slippage_bps", 0.0) or 0.0)
+        slip_pct = max(slip_pct, slip_bps / 100.0)
+    except Exception:
+        pass
+
+    fee_pct = max(0.0, TAKER_FEE * 100.0)
+    edge_buffer = EDGE_BUFFER_PCT_DEFAULT
+
+    def _update_param(key: str, auto_val: float, min_val: float, max_val: float, step: float) -> float:
+        ap = _get_ap(state, key, auto_val)
+        ap.auto = max(min_val, min(auto_val, max_val))
+        ap.auto = round(ap.auto, 6)
+        if (now_ts - ap.last_manual_ts) < 300:  # 5 min lock after manual edit
+            ap.effective = ap.manual
+        else:
+            target = ap.auto
+            if ap.mode == "manual":
+                target = ap.manual
+            elif ap.mode == "hybrid":
+                # Clamp auto within +/-20% of manual as guardrails
+                lo = ap.manual * 0.8
+                hi = ap.manual * 1.2
+                target = min(max(ap.auto, lo), hi)
+            ap.effective = _rate_limit(ap.effective, target, step)
+        ap.effective = max(min_val, min(ap.effective, max_val))
+        ap.last_update_ts = now_ts
+        state.autopilot[key] = ap
+        return ap.effective
+
+    # Trail %
+    trail_target = max(0.15, min(1.5, 0.20 + vol * 0.6))
+    state.effective_trail_pct = _update_param("trail_pct", trail_target, 0.1, 3.0, 0.1)
+
+    # TP1 fraction
+    if trend == "UP":
+        tp1_target = 0.40
+    elif trend == "DOWN":
+        tp1_target = 0.60
+    else:
+        tp1_target = 0.50
+    state.effective_tp1_frac = _update_param("tp1_frac", tp1_target, 0.2, 0.8, 0.05)
+
+    # Soft stop confirms (int but store float, apply int later)
+    soft_target = 1.0 if vol < 0.6 else 2.0
+    eff_soft = _update_param("soft_stop_confirms", soft_target, 1.0, 3.0, 1.0)
+    state.soft_stop_confirms = int(round(eff_soft))
+
+    # Hard stop multiplier
+    hard_target = max(1.2, min(2.0, 1.4 + vol * 0.1))
+    state.effective_hard_stop_mult = _update_param("hard_stop_mult", hard_target, 1.2, 2.5, 0.1)
+
+    # Max slippage %
+    slip_target = max(0.15, min(1.2, slip_pct * 1.3))
+    eff_slip = _update_param("max_slip_pct", slip_target, 0.05, 2.0, 0.1)
+    state.max_slip_pct = eff_slip
+
+    # Stop loss pct (hybrid): auto based on ATR, clamp against user input if provided
+    auto_stop_pct = max(0.30, min(1.20, 1.2 * vol))
+    manual_stop = STOP_LOSS_PCT
+    stop_min = float(manual_stop) if manual_stop is not None else 0.0
+    stop_max = 1.5 * stop_min if stop_min > 0 else 2.0
+    stop_min = stop_min if stop_min > 0 else 0.0
+    eff_stop = _update_param("stop_pct", auto_stop_pct, max(0.3, stop_min), max(2.0, stop_max), 0.05)
+    state.stop_loss_effective_pct = eff_stop if eff_stop > 0 else manual_stop
+
+    # Auto buy pct (%)
+    free_usdt = state.sim_balance_usdt if DRY_RUN else 0.0
+    if not DRY_RUN:
+        try:
+            bal = exchange.fetch_balance()
+            free_usdt = float(bal.get("free", {}).get("USDT") or 0.0)
+        except Exception:
+            free_usdt = state.sim_balance_usdt
+    equity = max(0.0, float(state.wallet_equity or 0.0))
+    risk_pct = 0.8  # percent of equity
+    risk_usdt = equity * (risk_pct / 100.0)
+    stop_assumed = state.stop_loss_effective_pct if state.stop_loss_effective_pct and state.stop_loss_effective_pct > 0 else max(0.35, 0.9 * vol)
+    stop_assumed = max(0.35, stop_assumed)
+    size_usdt = risk_usdt / (max(stop_assumed, 0.01) / 100.0)
+    auto_buy_pct = 100.0
+    if free_usdt > 0:
+        auto_buy_pct = max(20.0, min(100.0, (size_usdt / free_usdt) * 100.0))
+    # small-cap: if funds barely above min, go full size
+    _, _, min_notional = normalize_qty_for_market(exchange, last_price, 1.0)
+    if free_usdt < 2 * min_notional:
+        auto_buy_pct = 100.0
+    eff_auto_buy = _update_param("auto_buy_pct", auto_buy_pct, 20.0, 100.0, 5.0)
+    state.auto_buy_pct = eff_auto_buy / 100.0
+    state.auto_buy_pct_effective = state.auto_buy_pct
+
+    # Edge clamp helper: store min required move if you want to display
+    min_required = (2 * fee_pct) + spread_pct + slip_pct + edge_buffer
+    state.effective_edge_floor = min_required  # type: ignore
 
 def maybe_refresh_adaptive(exchange: ccxt.Exchange, state: BotState) -> None:
     """Called from trading loop. Keeps effective thresholds updated."""
@@ -910,6 +1118,10 @@ def maybe_refresh_adaptive(exchange: ccxt.Exchange, state: BotState) -> None:
                 state.effective_sell_threshold_pct = new_s
             else:
                 state.effective_sell_threshold_pct = (alpha * new_s) + ((1.0 - alpha) * old_s)
+
+            # Floors/edge clamps
+            buy_floor = max(0.08, 0.35 * state.blended_atr_per_min_pct)
+            state.effective_buy_threshold_pct = max(state.effective_buy_threshold_pct, buy_floor)
 
             # Keep state fields aligned (for persistence/UI)
             state.adaptive_profile = str(stats.get("profile") or state.adaptive_profile)
@@ -987,6 +1199,8 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
     use_rebound = bool(getattr(state, "use_dip_rebound", True))
     rebound_pct = max(0.0, float(getattr(state, "rebound_confirm_pct", REBOUND_CONFIRM_PCT_DEFAULT)))
     rebound_timeout = max(5.0, float(getattr(state, "dip_rebound_timeout_sec", DIP_REBOUND_TIMEOUT_SEC_DEFAULT)))
+    confirm_closes = max(1, int(getattr(state, "dip_confirm_closes", DIP_CONFIRM_CLOSES_DEFAULT)))
+    no_new_low_buf = max(0.0, float(DIP_NO_NEW_LOW_BUFFER_PCT))
 
     if last_price > buy_trigger_price:
         state.status = "WAIT_DIP"
@@ -1017,10 +1231,12 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
         rebound_ok = False
         if state.dip_low > 0 and last_price >= state.dip_low * (1 + rebound_pct / 100.0):
             rebound_ok = True
-        if state.dip_higher_close_count >= 2:
+        if state.dip_higher_close_count >= confirm_closes:
             rebound_ok = True
 
         timeout_hit = (now_ts - state.dip_wait_start_ts) >= rebound_timeout
+        if timeout_hit and state.dip_low > 0 and last_price >= state.dip_low * (1 + no_new_low_buf / 100.0):
+            rebound_ok = True
 
         if not rebound_ok and not timeout_hit:
             state.status = "WAIT_BOUNCE"
@@ -1094,11 +1310,12 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
 
     use_trailing = bool(getattr(state, "use_tp1_trailing", True))
     use_soft_stop = bool(getattr(state, "use_soft_stop", True))
-    soft_confirms = max(1, int(getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)))
-    hard_stop_mult = max(1.0, float(HARD_STOP_MULT_DEFAULT))
+    soft_confirms = max(1, int(getattr(position, "soft_confirms_used", getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT))))
+    hard_stop_mult = max(1.0, float(getattr(position, "hard_stop_mult_used", getattr(state, "effective_hard_stop_mult", HARD_STOP_MULT_DEFAULT))))
+    stop_pct_used = position.stop_pct_used if getattr(position, "stop_pct_used", None) else (state.stop_loss_effective_pct if state.stop_loss_effective_pct else STOP_LOSS_PCT)
     anchor_price = state.last_trade_price if state.last_trade_price is not None else position.entry_price
     sell_trigger = anchor_price * (1 + sell_thr / 100.0)
-    tp1_fraction = max(0.3, min(TP1_SELL_FRACTION, 0.6))
+    tp1_fraction = max(0.2, min(float(getattr(state, "effective_tp1_frac", TP1_SELL_FRACTION)), 0.8))
 
     # Legacy: single full take-profit with optional stop-loss/daily guardrails.
     if not use_trailing:
@@ -1120,9 +1337,9 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
             full_exit = True
             reason = "take_profit_threshold"
 
-        if (not full_exit) and (STOP_LOSS_PCT is not None):
-            stop_price = position.entry_price * (1 - STOP_LOSS_PCT / 100.0)
-            hard_stop_price = position.entry_price * (1 - (STOP_LOSS_PCT * hard_stop_mult) / 100.0)
+        if (not full_exit) and (stop_pct_used is not None):
+            stop_price = position.entry_price * (1 - stop_pct_used / 100.0)
+            hard_stop_price = position.entry_price * (1 - (stop_pct_used * hard_stop_mult) / 100.0)
 
             if last_price > stop_price:
                 state.soft_stop_counter = 0
@@ -1189,11 +1406,24 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     position.peak_price = max(position.peak_price, last_price)
 
     def _compute_trail_pct() -> float:
-        trail = max(TRAIL_STOP_PCT, sell_thr * 0.5)
+        trail_base = getattr(position, "trail_pct_used", getattr(state, "effective_trail_pct", TRAIL_STOP_PCT))
+        trail = max(trail_base, sell_thr * 0.5)
         atr_pct = float(getattr(state, "blended_atr_per_min_pct", 0.0) or 0.0)
         if TRAIL_ATR_MULT and atr_pct > 0:
             trail = max(trail, atr_pct * TRAIL_ATR_MULT)
         return max(trail, 0.0)
+
+    def _arm_trail_if_ready():
+        if getattr(position, "trail_armed", False):
+            return True
+        fee_pct = max(0.0, TAKER_FEE * 100.0)
+        slip_pct = max(EDGE_SLIPPAGE_FALLBACK_PCT, float(getattr(state, "last_slippage_bps", 0.0) or 0.0) / 100.0)
+        buffer_pct = 0.05
+        arm_pct = (2 * fee_pct) + slip_pct + buffer_pct
+        if position.tp1_done or last_price >= position.entry_price * (1 + arm_pct / 100.0):
+            position.trail_armed = True
+            return True
+        return False
 
     def _cancel_open_sell_if_any():
         oo = state.open_order
@@ -1210,7 +1440,14 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     def _finalize_close(exit_price: float, reason: str):
         state.position = None
         state.status = "WAIT_DIP"
-        state.next_trade_time = time.time() + POLL_INTERVAL_SECONDS
+        cooldown = POLL_INTERVAL_SECONDS
+        if reason in ("hard_stop", "stop_loss", "soft_stop"):
+            cooldown = max(POLL_INTERVAL_SECONDS, POLL_INTERVAL_SECONDS * 2)
+        elif reason == "trailing_stop":
+            cooldown = POLL_INTERVAL_SECONDS
+        elif reason in ("take_profit_threshold", "tp1_partial", "trailing_exit"):
+            cooldown = 0.0
+        state.next_trade_time = time.time() + cooldown
         state.last_trade_price = exit_price
         state.last_trade_side = "SELL"
         state.anchor_timestamp = time.time()
@@ -1256,9 +1493,10 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
         return True, filled_qty
 
     # Forced exits first (risk limits)
-    if STOP_LOSS_PCT is not None:
-        stop_price = position.entry_price * (1 - STOP_LOSS_PCT / 100.0)
-        hard_stop_price = position.entry_price * (1 - (STOP_LOSS_PCT * hard_stop_mult) / 100.0)
+    stop_pct_used = position.stop_pct_used if getattr(position, "stop_pct_used", None) else (state.stop_loss_effective_pct if state.stop_loss_effective_pct else STOP_LOSS_PCT)
+    if stop_pct_used is not None:
+        stop_price = position.entry_price * (1 - stop_pct_used / 100.0)
+        hard_stop_price = position.entry_price * (1 - (stop_pct_used * hard_stop_mult) / 100.0)
 
         if last_price > stop_price:
             state.soft_stop_counter = 0
@@ -1297,18 +1535,20 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     if (not position.tp1_done) and last_price >= sell_trigger:
         qty_exit = position.qty * tp1_fraction
         min_qty = MIN_NOTIONAL_USDT / max(last_price, 1e-9)
-        if qty_exit < min_qty:
-            qty_exit = min(position.qty, max(min_qty, qty_exit))
-
-        closed, filled_qty = _execute_market_exit(qty_exit, "tp1_partial")
-        if state.position is None or closed:
-            return
-        if filled_qty > 0:
-            position.tp1_done = True
-            position.peak_price = max(position.peak_price, last_price)
+        if qty_exit * last_price < MIN_NOTIONAL_USDT or qty_exit < min_qty:
+            position.tp1_done = True  # skip TP1, go to trailing/full logic
+        else:
+            closed, filled_qty = _execute_market_exit(qty_exit, "tp1_partial")
+            if state.position is None or closed:
+                return
+            if filled_qty > 0:
+                position.tp1_done = True
+                position.peak_price = max(position.peak_price, last_price)
 
     # Trailing stop on the remainder
     if position.tp1_done and position.qty > 0:
+        if not _arm_trail_if_ready():
+            return
         position.peak_price = max(position.peak_price, last_price)
         trail_stop_price = position.peak_price * (1 - _compute_trail_pct() / 100.0)
         trail_stop_price = max(trail_stop_price, position.entry_price)
@@ -1403,6 +1643,11 @@ def adopt_position_from_wallet(state: BotState, last_price: float):
             entry_index=-1,
             entry_fee=0.0,
             peak_price=last_price,
+            trail_armed=False,
+            trail_pct_used=float(getattr(state, "effective_trail_pct", TRAIL_STOP_PCT)),
+            stop_pct_used=float(getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT)) if (getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT) is not None) else None,
+            hard_stop_mult_used=float(getattr(state, "effective_hard_stop_mult", HARD_STOP_MULT_DEFAULT)),
+            soft_confirms_used=int(getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)),
         )
         state.position = pos
         state.last_trade_price = last_price
@@ -1568,7 +1813,13 @@ def handle_command(cmd: str, state: BotState, exchange: ccxt.Exchange):
                 log_event(state, f"[ERROR] Manual BUY: balance error: {e}")
                 return
 
-        spend = available_usdt * max(0.0, min(state.manual_buy_pct, 1.0))
+        spend_pct = max(0.0, min(state.manual_buy_pct, 1.0))
+        try:
+            if _ap_mode(state, "auto_buy_pct") == "hybrid":
+                spend_pct = min(spend_pct, max(0.0, min(state.auto_buy_pct, 1.0)))
+        except Exception:
+            pass
+        spend = available_usdt * spend_pct
         if spend < MIN_NOTIONAL_USDT:
             log_event(state, f"Manual BUY skipped: not enough USDT (have {available_usdt:.2f}).")
             return
@@ -1704,6 +1955,9 @@ def trading_loop(exchange: ccxt.Exchange, state: BotState, cmd_queue: "queue.Que
             # Update adaptive thresholds (if enabled)
             maybe_refresh_adaptive(exchange, state)
 
+            new_candle = state.last_candle_ts is None or last_ts > state.last_candle_ts
+            maybe_update_autopilot(exchange, state, last_price, new_candle)
+
             now_dt = dt.datetime.now(dt.timezone.utc)
             if now_dt.date() != state.day_start_date:
                 state.day_start_date = now_dt.date()
@@ -1718,7 +1972,6 @@ def trading_loop(exchange: ccxt.Exchange, state: BotState, cmd_queue: "queue.Que
             if state.position:
                 manage_position(exchange, state, df)
 
-            new_candle = state.last_candle_ts is None or last_ts > state.last_candle_ts
             if new_candle:
                 state.last_candle_ts = last_ts
                 if not state.position:
@@ -1973,6 +2226,7 @@ class BotGUI:
         e_auto.grid(row=2, column=1, sticky="e", padx=8, pady=(10, 2))
         e_auto.bind("<Return>", self.on_auto_buy_entry)
         e_auto.bind("<FocusOut>", self.on_auto_buy_entry)
+        self.auto_buy_entry = e_auto
 
         self.auto_buy_display_var = tk.StringVar(value="")
         ttk.Label(card, textvariable=self.auto_buy_display_var).grid(
@@ -1984,6 +2238,7 @@ class BotGUI:
         e_manual.grid(row=4, column=1, sticky="e", padx=8, pady=(6, 2))
         e_manual.bind("<Return>", self.on_manual_buy_entry)
         e_manual.bind("<FocusOut>", self.on_manual_buy_entry)
+        self.manual_buy_entry = e_manual
 
         self.manual_buy_display_var = tk.StringVar(value="")
         ttk.Label(card, textvariable=self.manual_buy_display_var).grid(
@@ -1997,6 +2252,7 @@ class BotGUI:
         e_msell.grid(row=6, column=1, sticky="e", padx=8, pady=(6, 2))
         e_msell.bind("<Return>", self.on_manual_sell_entry)
         e_msell.bind("<FocusOut>", self.on_manual_sell_entry)
+        self.manual_sell_entry = e_msell
 
 
         # --- Advanced trading parameters (limits, SL, timing, manual sell) ---
@@ -2027,7 +2283,10 @@ class BotGUI:
         for idx, (lbl, var) in enumerate(adv_fields):
             r = base_row + idx
             ttk.Label(card, text=lbl).grid(row=r, column=0, sticky="w", padx=8, pady=3)
-            ttk.Entry(card, textvariable=var, width=12).grid(row=r, column=1, sticky="e", padx=8, pady=3)
+            ent = ttk.Entry(card, textvariable=var, width=12)
+            ent.grid(row=r, column=1, sticky="e", padx=8, pady=3)
+            if lbl.startswith("Stop loss"):
+                self.stop_loss_entry = ent
 
         ttk.Button(card, text="Apply Trading Config", command=self.on_apply_config).grid(
             row=base_row + len(adv_fields), column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 8)
@@ -2243,18 +2502,25 @@ class BotGUI:
         e_rt.bind("<Return>", self._on_rebound_timeout)
         e_rt.bind("<FocusOut>", self._on_rebound_timeout)
 
+        ttk.Label(card, text="Higher closes to confirm").grid(row=8, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.rebound_confirms_var = tk.StringVar(value=str(getattr(self.state, "dip_confirm_closes", DIP_CONFIRM_CLOSES_DEFAULT)))
+        e_rc = ttk.Entry(card, textvariable=self.rebound_confirms_var, width=10)
+        e_rc.grid(row=8, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_rc.bind("<Return>", self._on_rebound_confirms)
+        e_rc.bind("<FocusOut>", self._on_rebound_confirms)
+
         ttk.Label(
             card,
-            text="Wait for a tiny bounce or 2 higher closes before buying the dip; timeout to avoid waiting forever.",
+            text="Wait for a tiny bounce or a few higher closes before buying the dip; timeout to avoid waiting forever.",
             wraplength=self.SIDEBAR_WIDTH - 60,
             justify="left",
             foreground="#666",
-        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
 
         self.edge_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_edge_aware_thresholds", USE_EDGE_AWARE_THRESHOLDS_DEFAULT)))
-        ttk.Label(card, text="Edge-aware thresholds").grid(row=9, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(card, text="Edge-aware thresholds").grid(row=10, column=0, sticky="w", padx=8, pady=(4, 2))
         ttk.Checkbutton(card, variable=self.edge_toggle_var, command=self._on_toggle_edge_aware).grid(
-            row=9, column=1, sticky="w", padx=8, pady=(4, 2)
+            row=10, column=1, sticky="w", padx=8, pady=(4, 2)
         )
         ttk.Label(
             card,
@@ -2262,17 +2528,17 @@ class BotGUI:
             wraplength=self.SIDEBAR_WIDTH - 60,
             justify="left",
             foreground="#666",
-        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+        ).grid(row=11, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
 
         self.ioc_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT)))
-        ttk.Label(card, text="IOC with slippage cap").grid(row=11, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(card, text="IOC with slippage cap").grid(row=12, column=0, sticky="w", padx=8, pady=(4, 2))
         ttk.Checkbutton(card, variable=self.ioc_toggle_var, command=self._on_toggle_ioc_cap).grid(
-            row=11, column=1, sticky="w", padx=8, pady=(4, 2)
+            row=12, column=1, sticky="w", padx=8, pady=(4, 2)
         )
-        ttk.Label(card, text="Max slip % (over best bid/ask)").grid(row=12, column=0, sticky="w", padx=8, pady=(2, 2))
+        ttk.Label(card, text="Max slip % (over best bid/ask)").grid(row=13, column=0, sticky="w", padx=8, pady=(2, 2))
         self.max_slip_var = tk.StringVar(value=f"{getattr(self.state, 'max_slip_pct', MAX_SLIP_PCT_DEFAULT):.3f}")
         e_ms = ttk.Entry(card, textvariable=self.max_slip_var, width=10)
-        e_ms.grid(row=12, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_ms.grid(row=13, column=1, sticky="w", padx=8, pady=(2, 2))
         e_ms.bind("<Return>", self._on_max_slip_pct)
         e_ms.bind("<FocusOut>", self._on_max_slip_pct)
 
@@ -2282,8 +2548,44 @@ class BotGUI:
             wraplength=self.SIDEBAR_WIDTH - 60,
             justify="left",
             foreground="#666",
-        ).grid(row=13, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        ).grid(row=14, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
         card.columnconfigure(1, weight=1)
+
+        # Autopilot controls
+        ap_card = ttk.LabelFrame(parent, text="Autopilot (manual / auto / hybrid)")
+        ap_card.pack(fill="x", padx=6, pady=(4, 6))
+        self.ap_controls = {}
+
+        def _ap_row(parent_row: int, label: str, key: str, fmt: str = ".3f"):
+            mode_var = tk.StringVar(value=_get_ap(self.state, key, 0).mode)
+            manual_var = tk.StringVar(value=f"{_get_ap(self.state, key, 0).manual:{fmt}}")
+            auto_var = tk.StringVar(value="-")
+            eff_var = tk.StringVar(value="-")
+            ttk.Label(ap_card, text=label).grid(row=parent_row, column=0, sticky="w", padx=6, pady=2)
+            cb = ttk.Combobox(ap_card, values=["manual", "auto", "hybrid"], state="readonly", width=8, textvariable=mode_var)
+            cb.grid(row=parent_row, column=1, sticky="w", padx=4, pady=2)
+            cb.bind("<<ComboboxSelected>>", lambda _e, k=key, v=mode_var: self._on_autopilot_mode(k, v))
+            ent = ttk.Entry(ap_card, textvariable=manual_var, width=8)
+            ent.grid(row=parent_row, column=2, sticky="w", padx=4, pady=2)
+            ent.bind("<Return>", lambda _e, k=key, v=manual_var: self._on_autopilot_manual(k, v))
+            ent.bind("<FocusOut>", lambda _e, k=key, v=manual_var: self._on_autopilot_manual(k, v))
+            ttk.Label(ap_card, textvariable=auto_var, width=10).grid(row=parent_row, column=3, sticky="w", padx=4, pady=2)
+            ttk.Label(ap_card, textvariable=eff_var, width=10).grid(row=parent_row, column=4, sticky="w", padx=4, pady=2)
+            self.ap_controls[key] = {"mode": mode_var, "manual": manual_var, "auto": auto_var, "eff": eff_var, "entry": ent}
+
+        ttk.Label(ap_card, text="Mode").grid(row=0, column=1, padx=4)
+        ttk.Label(ap_card, text="Manual").grid(row=0, column=2, padx=4)
+        ttk.Label(ap_card, text="Auto").grid(row=0, column=3, padx=4)
+        ttk.Label(ap_card, text="Effective").grid(row=0, column=4, padx=4)
+
+        _ap_row(1, "Trail %", "trail_pct", ".3f")
+        _ap_row(2, "TP1 fraction", "tp1_frac", ".3f")
+        _ap_row(3, "Soft stop closes", "soft_stop_confirms", ".0f")
+        _ap_row(4, "Hard stop x", "hard_stop_mult", ".2f")
+        _ap_row(5, "Stop %", "stop_pct", ".3f")
+        _ap_row(6, "Max slip %", "max_slip_pct", ".3f")
+        for c in range(5):
+            ap_card.columnconfigure(c, weight=1)
 
     def _sync_tf_selection(self, tfs: List[str]):
         try:
@@ -2652,6 +2954,18 @@ class BotGUI:
         save_settings(self.state)
         log_event(self.state, f"Rebound timeout set to {v:.0f}s")
 
+    def _on_rebound_confirms(self, event=None):
+        raw = self.rebound_confirms_var.get().strip()
+        try:
+            v = max(1, int(float(raw)))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.dip_confirm_closes = v
+        self.rebound_confirms_var.set(str(v))
+        save_settings(self.state)
+        log_event(self.state, f"Dip confirm closes set to {v}")
+
     def _on_toggle_edge_aware(self):
         want = bool(self.edge_toggle_var.get())
         with self.state.lock:
@@ -2677,6 +2991,51 @@ class BotGUI:
         self.max_slip_var.set(f"{v:.3f}")
         save_settings(self.state)
         log_event(self.state, f"Max slip pct set to {v:.3f}%")
+
+    def _on_autopilot_mode(self, key: str, var: tk.StringVar):
+        mode = var.get().strip().lower()
+        if mode not in ("manual", "auto", "hybrid"):
+            return
+        with self.state.lock:
+            ap = _get_ap(self.state, key, 0.0)
+            ap.mode = mode
+            self.state.autopilot[key] = ap
+        save_settings(self.state)
+        log_event(self.state, f"Autopilot {key} mode -> {mode}")
+        # Gray out manual entry when in auto
+        try:
+            ctrl = self.ap_controls.get(key)
+            if ctrl and "entry" in ctrl:
+                ctrl["entry"].configure(state="disabled" if mode == "auto" else "normal")
+        except Exception:
+            pass
+
+    def _on_autopilot_manual(self, key: str, var: tk.StringVar):
+        raw = var.get().strip()
+        try:
+            v = float(raw)
+        except Exception:
+            return
+        now_ts = time.time()
+        with self.state.lock:
+            ap = _get_ap(self.state, key, v)
+            ap.manual = v
+            ap.last_manual_ts = now_ts
+            ap.effective = v if ap.mode == "manual" else ap.effective
+            self.state.autopilot[key] = ap
+            if key == "trail_pct":
+                self.state.effective_trail_pct = v
+            elif key == "tp1_frac":
+                self.state.effective_tp1_frac = v
+            elif key == "soft_stop_confirms":
+                self.state.soft_stop_confirms = int(round(v))
+            elif key == "hard_stop_mult":
+                self.state.effective_hard_stop_mult = v
+            elif key == "max_slip_pct":
+                self.state.max_slip_pct = v
+        var.set(f"{v:.3f}")
+        save_settings(self.state)
+        log_event(self.state, f"Autopilot {key} manual -> {v}")
 
 
     def on_buy_threshold_change(self, value: str):
@@ -2985,6 +3344,11 @@ class BotGUI:
                     self.rebound_timeout_var.set(f"{float(getattr(s, 'dip_rebound_timeout_sec', DIP_REBOUND_TIMEOUT_SEC_DEFAULT)):.0f}")
                 except Exception:
                     pass
+            if hasattr(self, "rebound_confirms_var"):
+                try:
+                    self.rebound_confirms_var.set(str(int(getattr(s, "dip_confirm_closes", DIP_CONFIRM_CLOSES_DEFAULT))))
+                except Exception:
+                    pass
             if hasattr(self, "edge_toggle_var"):
                 try:
                     self.edge_toggle_var.set(bool(use_edge))
@@ -3000,6 +3364,27 @@ class BotGUI:
                     self.max_slip_var.set(f"{float(getattr(s, 'max_slip_pct', MAX_SLIP_PCT_DEFAULT)):.3f}")
                 except Exception:
                     pass
+            if hasattr(self, "ap_controls"):
+                defaults_map = {
+                    "trail_pct": getattr(self.state, "effective_trail_pct", TRAIL_STOP_PCT),
+                    "tp1_frac": getattr(self.state, "effective_tp1_frac", TP1_SELL_FRACTION),
+                    "soft_stop_confirms": float(getattr(self.state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)),
+                    "hard_stop_mult": getattr(self.state, "effective_hard_stop_mult", HARD_STOP_MULT_DEFAULT),
+                    "max_slip_pct": float(getattr(self.state, "max_slip_pct", MAX_SLIP_PCT_DEFAULT)),
+                    "stop_pct": float(getattr(self.state, "stop_loss_effective_pct", STOP_LOSS_PCT if STOP_LOSS_PCT is not None else 0.0)),
+                    "auto_buy_pct": float(getattr(self.state, "auto_buy_pct_effective", s.auto_buy_pct * 100.0)),
+                }
+                for key, vars_map in self.ap_controls.items():
+                    try:
+                        ap = _get_ap(self.state, key, defaults_map.get(key, 0.0))
+                        vars_map["mode"].set(ap.mode)
+                        vars_map["manual"].set(f"{ap.manual:.3f}")
+                        vars_map["auto"].set(f"{ap.auto:.3f}")
+                        vars_map["eff"].set(f"{ap.effective:.3f}")
+                        if "entry" in vars_map:
+                            vars_map["entry"].configure(state="disabled" if ap.mode == "auto" else "normal")
+                    except Exception:
+                        continue
         except Exception:
             pass
 
@@ -3015,6 +3400,17 @@ class BotGUI:
                     self.adaptive_info_var.set(
                         f"USING MANUAL: BUY {buy_thr:.3f}% · SELL {sell_thr:.3f}%"
                     )
+        except Exception:
+            pass
+
+        # Gray out live-parameter entries when their autopilot mode is auto
+        try:
+            ap_auto_buy = _ap_mode(self.state, "auto_buy_pct")
+            if hasattr(self, "auto_buy_entry"):
+                self.auto_buy_entry.configure(state="disabled" if ap_auto_buy == "auto" else "normal")
+            ap_stop = _ap_mode(self.state, "stop_pct")
+            if hasattr(self, "stop_loss_entry"):
+                self.stop_loss_entry.configure(state="disabled" if ap_stop == "auto" else "normal")
         except Exception:
             pass
 
@@ -3131,6 +3527,7 @@ def run_bot():
     try:
         if "STOP_LOSS_PCT" in settings:
             STOP_LOSS_PCT = settings["STOP_LOSS_PCT"]
+            state.stop_loss_effective_pct = STOP_LOSS_PCT
         if "DAILY_MAX_LOSS_USDT" in settings:
             DAILY_MAX_LOSS_USDT = float(settings["DAILY_MAX_LOSS_USDT"])
         if "DAILY_MAX_PROFIT_USDT" in settings:
@@ -3198,6 +3595,21 @@ def run_bot():
                     state.max_slip_pct = max(0.01, float(settings["max_slip_pct"]))
                 except Exception:
                     state.max_slip_pct = config.MAX_SLIP_PCT_DEFAULT
+            if "dip_confirm_closes" in settings:
+                try:
+                    state.dip_confirm_closes = max(1, int(settings["dip_confirm_closes"]))
+                except Exception:
+                    state.dip_confirm_closes = config.DIP_CONFIRM_CLOSES_DEFAULT
+            if "autopilot" in settings and isinstance(settings["autopilot"], dict):
+                for k, v in settings["autopilot"].items():
+                    try:
+                        ap = _get_ap(state, k, float(v.get("manual", 0.0) or 0.0))
+                        ap.manual = float(v.get("manual", ap.manual))
+                        ap.mode = str(v.get("mode", ap.mode) or ap.mode)
+                        ap.effective = ap.manual
+                        state.autopilot[k] = ap
+                    except Exception:
+                        continue
 
             if "total_realized_pnl" in settings:
                 state.total_realized_pnl = float(settings["total_realized_pnl"])
@@ -3241,6 +3653,15 @@ def run_bot():
 
             state.effective_buy_threshold_pct = float(settings.get("effective_buy_threshold_pct", state.buy_threshold_pct))
             state.effective_sell_threshold_pct = float(settings.get("effective_sell_threshold_pct", state.sell_threshold_pct))
+
+            # Seed autopilot defaults
+            _get_ap(state, "trail_pct", float(getattr(state, "effective_trail_pct", config.TRAIL_STOP_PCT)))
+            _get_ap(state, "tp1_frac", float(getattr(state, "effective_tp1_frac", config.TP1_SELL_FRACTION)))
+            _get_ap(state, "soft_stop_confirms", float(getattr(state, "soft_stop_confirms", config.SOFT_STOP_CONFIRMS_DEFAULT)))
+            _get_ap(state, "hard_stop_mult", float(getattr(state, "effective_hard_stop_mult", config.HARD_STOP_MULT_DEFAULT)))
+            _get_ap(state, "max_slip_pct", float(getattr(state, "max_slip_pct", config.MAX_SLIP_PCT_DEFAULT)))
+            _get_ap(state, "stop_pct", float(getattr(state, "stop_loss_effective_pct", STOP_LOSS_PCT if STOP_LOSS_PCT is not None else 0.0)))
+            _get_ap(state, "auto_buy_pct", float(getattr(state, "auto_buy_pct_effective", state.auto_buy_pct * 100.0)))
     except Exception:
         pass
 

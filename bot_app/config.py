@@ -21,12 +21,14 @@ USE_EDGE_AWARE_THRESHOLDS_DEFAULT = True  # clamp thresholds to cover fees + spr
 USE_IOC_SLIPPAGE_CAP_DEFAULT = True       # switch market orders to IOC limits with slippage cap
 
 # Soft/Hard stop settings
-SOFT_STOP_CONFIRMS_DEFAULT = 2    # closes below stop before exiting (soft stop)
-HARD_STOP_MULT_DEFAULT = 1.7      # hard-stop triggers at this multiple of stop distance (e.g., 1.7x stop depth)
+SOFT_STOP_CONFIRMS_DEFAULT = 1    # closes below stop before exiting (soft stop)
+HARD_STOP_MULT_DEFAULT = 1.5      # hard-stop triggers at this multiple of stop distance (e.g., 1.5x stop depth)
 
 # Dip-to-bounce entry settings
-REBOUND_CONFIRM_PCT_DEFAULT = 0.15      # % rebound off dip low to confirm entry
-DIP_REBOUND_TIMEOUT_SEC_DEFAULT = 120.0 # max seconds to wait for rebound confirmation
+REBOUND_CONFIRM_PCT_DEFAULT = 0.08      # % rebound off dip low to confirm entry (light)
+DIP_REBOUND_TIMEOUT_SEC_DEFAULT = 90.0  # max seconds to wait for rebound confirmation
+DIP_CONFIRM_CLOSES_DEFAULT = 1          # number of higher closes to confirm bounce
+DIP_NO_NEW_LOW_BUFFER_PCT = 0.02        # 0.02% buffer for "no new lows" timeout fallback
 
 # Edge-aware thresholds
 EDGE_BUFFER_PCT_DEFAULT = 0.05         # extra cushion on top of costs (in %)
@@ -35,6 +37,9 @@ EDGE_SLIPPAGE_FALLBACK_PCT = 0.05      # fallback slippage % if last slippage un
 
 # IOC slippage cap for execution (percent)
 MAX_SLIP_PCT_DEFAULT = 0.60            # 0.60% default cap over best bid/ask for IOC limits
+
+# Trailing defaults tuned for scalping
+TRAIL_STOP_PCT = 0.30                  # base trail giveback %
 
 # ---- DRY_RUN slippage simulator (order book based) ----
 # If enabled, DRY_RUN market orders will fill using the live order book depth,

@@ -48,6 +48,8 @@ def save_settings(state: BotState) -> None:
                 "use_edge_aware_thresholds": bool(getattr(state, "use_edge_aware_thresholds", config.USE_EDGE_AWARE_THRESHOLDS_DEFAULT)),
                 "use_ioc_slippage_cap": bool(getattr(state, "use_ioc_slippage_cap", config.USE_IOC_SLIPPAGE_CAP_DEFAULT)),
                 "max_slip_pct": float(getattr(state, "max_slip_pct", config.MAX_SLIP_PCT_DEFAULT)),
+                "dip_confirm_closes": int(getattr(state, "dip_confirm_closes", config.DIP_CONFIRM_CLOSES_DEFAULT)),
+                "autopilot": {k: {"manual": float(v.manual), "mode": str(v.mode)} for k, v in (getattr(state, "autopilot", {}) or {}).items()},
 
                 # lifetime stats
                 "total_realized_pnl": float(getattr(state, "total_realized_pnl", 0.0)),

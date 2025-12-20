@@ -21,6 +21,21 @@ class Position:
     last_exit_reason: Optional[str] = None
     tp1_done: bool = False
     peak_price: float = 0.0
+    trail_armed: bool = False
+    trail_pct_used: float = config.TRAIL_STOP_PCT
+    stop_pct_used: Optional[float] = None
+    hard_stop_mult_used: float = config.HARD_STOP_MULT_DEFAULT
+    soft_confirms_used: int = config.SOFT_STOP_CONFIRMS_DEFAULT
+
+
+@dataclass
+class AutopilotParam:
+    manual: float
+    auto: float
+    effective: float
+    mode: str = "manual"  # manual | auto | hybrid
+    last_manual_ts: float = 0.0
+    last_update_ts: float = 0.0
 
 
 @dataclass
@@ -57,6 +72,14 @@ class BotState:
     use_edge_aware_thresholds: bool = config.USE_EDGE_AWARE_THRESHOLDS_DEFAULT
     use_ioc_slippage_cap: bool = config.USE_IOC_SLIPPAGE_CAP_DEFAULT
     max_slip_pct: float = config.MAX_SLIP_PCT_DEFAULT
+    dip_confirm_closes: int = config.DIP_CONFIRM_CLOSES_DEFAULT
+    effective_trail_pct: float = config.TRAIL_STOP_PCT
+    effective_tp1_frac: float = config.TP1_SELL_FRACTION
+    effective_hard_stop_mult: float = config.HARD_STOP_MULT_DEFAULT
+    autopilot: Dict[str, AutopilotParam] = field(default_factory=dict)
+    effective_edge_floor: float = 0.0
+    stop_loss_effective_pct: Optional[float] = None
+    auto_buy_pct_effective: float = config.AUTO_BUY_PCT_DEFAULT
 
     daily_realized_pnl: float = 0.0
     day_start_date: dt.date = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).date())
