@@ -51,6 +51,14 @@ def save_settings(state: BotState) -> None:
                 "dip_confirm_closes": int(getattr(state, "dip_confirm_closes", config.DIP_CONFIRM_CLOSES_DEFAULT)),
                 "autopilot": {k: {"manual": float(v.manual), "mode": str(v.mode)} for k, v in (getattr(state, "autopilot", {}) or {}).items()},
 
+                # auto coin (trending scanner)
+                "auto_coin_enabled": bool(getattr(state, "auto_coin_enabled", config.AUTO_COIN_ENABLED_DEFAULT)),
+                "auto_coin_policy": str(getattr(state, "auto_coin_policy", config.AUTO_COIN_POLICY_DEFAULT)),
+                "auto_coin_scan_interval_sec": float(getattr(state, "auto_coin_scan_interval_sec", config.AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT)),
+                "auto_coin_dwell_min": float(getattr(state, "auto_coin_dwell_min", config.AUTO_COIN_DWELL_MIN_DEFAULT)),
+                "auto_coin_hysteresis_pct": float(getattr(state, "auto_coin_hysteresis_pct", config.AUTO_COIN_HYSTERESIS_PCT_DEFAULT)),
+                "auto_coin_candidates_n": int(getattr(state, "auto_coin_candidates_n", config.AUTO_COIN_CANDIDATES_N_DEFAULT)),
+
                 # lifetime stats
                 "total_realized_pnl": float(getattr(state, "total_realized_pnl", 0.0)),
                 "total_runtime_sec": float(getattr(state, "total_runtime_sec", 0.0)) + max(0.0, (time.time() - float(getattr(state, "session_start_ts", time.time())))),

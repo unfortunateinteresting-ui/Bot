@@ -23,10 +23,16 @@
     0.1
   ],
   "auto_buy_pct": 1.0,
+  "auto_coin_candidates_n": 20,
+  "auto_coin_dwell_min": 15.0,
+  "auto_coin_enabled": true,
+  "auto_coin_hysteresis_pct": 20.0,
+  "auto_coin_policy": "flat",
+  "auto_coin_scan_interval_sec": 90.0,
   "autopilot": {
     "auto_buy_pct": {
       "manual": 100.0,
-      "mode": "manual"
+      "mode": "auto"
     },
     "hard_stop_mult": {
       "manual": 0.0,
@@ -53,21 +59,21 @@
       "mode": "auto"
     }
   },
-  "avg_high": 0.4071675642857142,
-  "avg_low": 0.40342786428571425,
-  "avg_range_pct": 0.3365981208149295,
-  "blended_atr_per_min_pct": 0.3365981208149295,
+  "avg_high": 0.0031863999999999994,
+  "avg_low": 0.003163542857142857,
+  "avg_range_pct": 0.3085420154430938,
+  "blended_atr_per_min_pct": 0.3085420154430938,
   "buy_threshold_pct": 1.0,
   "data_driven": true,
   "data_lookback": 60,
   "data_refresh_sec": 30,
   "data_timeframe": "5m",
-  "data_trend": "UP",
+  "data_trend": "DOWN",
   "dip_confirm_closes": 1,
   "dip_rebound_timeout_sec": 120.0,
   "dry_run": true,
-  "effective_buy_threshold_pct": 0.5178014532999958,
-  "effective_sell_threshold_pct": 0.961631270414278,
+  "effective_buy_threshold_pct": 0.811843458029514,
+  "effective_sell_threshold_pct": 0.6396342396596171,
   "manual_buy_pct": 1.0,
   "manual_sell_pct": 1.0,
   "max_slip_pct": 0.15,
@@ -75,11 +81,11 @@
   "sell_threshold_pct": 1.0,
   "soft_stop_confirms": 1,
   "symbol": "BOT/USDT",
-  "total_realized_pnl": -0.09042149564089885,
-  "total_runtime_sec": 79076.51932144165,
+  "total_realized_pnl": -16.88160355688511,
+  "total_runtime_sec": 137181.6577398777,
   "use_dip_rebound": true,
   "use_edge_aware_thresholds": true,
   "use_ioc_slippage_cap": true,
   "use_soft_stop": true,
-  "use_tp1_trailing": true
+  "use_tp1_trailing": false
 }

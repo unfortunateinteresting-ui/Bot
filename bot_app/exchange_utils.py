@@ -12,7 +12,7 @@ def init_exchange() -> ccxt.Exchange:
         "enableRateLimit": True,
     })
     if hasattr(exchange, "options"):
-        exchange.options["createMarketBuyOrderRequiresPrice"] = True
+        exchange.options["createMarketBuyOrderRequiresPrice"] = False
     exchange.load_markets()
     return exchange
 

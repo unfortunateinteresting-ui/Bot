@@ -75,6 +75,18 @@ MANUAL_BUY_PCT_DEFAULT = 1.0  # % of USDT used by the Manual BUY button (1.0 = 1
 AUTO_BUY_PCT_DEFAULT = 1.0    # % of USDT used by automatic entries (1.0 = 100%)
 MANUAL_SELL_PCT_DEFAULT = 1.0  # % of position sold by the Manual SELL button (1.0 = 100%)
 
+# Auto Coin (Trending Scanner)
+AUTO_COIN_ENABLED_DEFAULT = False
+AUTO_COIN_POLICY_DEFAULT = "flat"          # "flat" or "force"
+AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT = 90.0
+AUTO_COIN_DWELL_MIN_DEFAULT = 15.0
+AUTO_COIN_HYSTERESIS_PCT_DEFAULT = 20.0
+AUTO_COIN_CANDIDATES_N_DEFAULT = 20
+
+AUTO_COIN_MIN_VALUE_USDT = 250_000.0
+AUTO_COIN_MIN_VALUE_FALLBACK_USDT = 100_000.0
+AUTO_COIN_SPREAD_BPS_MAX = 60.0
+AUTO_COIN_SLIP_BPS_MAX = 120.0
 
 # ---- Persistence ----
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot1_settings.json")

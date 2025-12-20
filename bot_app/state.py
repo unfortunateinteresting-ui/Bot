@@ -80,6 +80,21 @@ class BotState:
     effective_edge_floor: float = 0.0
     stop_loss_effective_pct: Optional[float] = None
     auto_buy_pct_effective: float = config.AUTO_BUY_PCT_DEFAULT
+    # Auto coin (trending scanner)
+    auto_coin_enabled: bool = config.AUTO_COIN_ENABLED_DEFAULT
+    auto_coin_policy: str = config.AUTO_COIN_POLICY_DEFAULT
+    auto_coin_scan_interval_sec: float = config.AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT
+    auto_coin_dwell_min: float = config.AUTO_COIN_DWELL_MIN_DEFAULT
+    auto_coin_hysteresis_pct: float = config.AUTO_COIN_HYSTERESIS_PCT_DEFAULT
+    auto_coin_candidates_n: int = config.AUTO_COIN_CANDIDATES_N_DEFAULT
+    auto_coin_last_scan_ts: float = 0.0
+    auto_coin_last_switch_ts: float = 0.0
+    auto_coin_last_winner: str = ""
+    auto_coin_winner_streak: int = 0
+    auto_coin_relax_factor: float = 1.0
+    auto_coin_current_score: float = 0.0
+    auto_coin_top_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    auto_coin_last_scan_info: str = ""
 
     daily_realized_pnl: float = 0.0
     day_start_date: dt.date = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).date())

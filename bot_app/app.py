@@ -16,7 +16,12 @@ import sys
 import time
 import traceback
 import datetime as dt
+import json
+import math
+import statistics
 from typing import Optional, List, Tuple, Dict, Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 import threading
 import queue
 
@@ -55,6 +60,12 @@ from bot_app.exchange_utils import (
 from bot_app.settings_io import load_settings, save_settings
 from bot_app.state import AutopilotParam, BotState, OpenOrder, Position, log_event
 
+
+COINEX_API_BASE = "https://api.coinex.com/v2"
+COINEX_PUBLIC_TIMEOUT_SEC = 8.0
+AUTO_COIN_NOTIONAL_USDT = 100.0
+SMART_MARKET_FRICTION_BPS = 120.0
+SMART_MARKET_NOTIONAL_USDT = 100.0
 
 
 ################################################################
@@ -145,6 +156,58 @@ def simulate_dry_run_market_fill(exchange: ccxt.Exchange, symbol: str, side: str
         return qty_base, price_fallback, price_fallback, price_fallback, 0
 
 
+def simulate_dry_run_ioc_fill(exchange: ccxt.Exchange, symbol: str, side: str, qty_base: float,
+                              limit_price: float) -> Tuple[float, float, float, float, int]:
+    """Simulate IOC limit fill; only consumes levels within cap."""
+    if qty_base <= 0 or limit_price <= 0:
+        return 0.0, limit_price, 0.0, 0.0, 0
+
+    try:
+        ob = exchange.fetch_order_book(symbol, limit=SLIPPAGE_ORDERBOOK_LEVELS)
+        levels = (ob.get("asks") if side == "buy" else ob.get("bids")) or []
+
+        remaining = float(qty_base)
+        filled = 0.0
+        cost = 0.0
+        best = 0.0
+        worst = 0.0
+        used = 0
+
+        for lvl in levels:
+            if remaining <= 0:
+                break
+            if not lvl or len(lvl) < 2:
+                continue
+            price = float(lvl[0])
+            amount = float(lvl[1])
+            if amount <= 0 or price <= 0:
+                continue
+
+            if side == "buy" and price > limit_price:
+                break
+            if side == "sell" and price < limit_price:
+                break
+
+            take = min(remaining, amount)
+            if best == 0.0:
+                best = price
+            worst = price
+
+            cost += take * price
+            filled += take
+            remaining -= take
+            used += 1
+
+        if filled <= 0:
+            return 0.0, limit_price, 0.0, 0.0, used
+
+        avg_price = cost / filled if filled > 0 else limit_price
+        return filled, avg_price, best or avg_price, worst or avg_price, used
+
+    except Exception:
+        return 0.0, limit_price, 0.0, 0.0, 0
+
+
 def normalize_qty_for_market(exchange: ccxt.Exchange, price: float, qty: float) -> Tuple[float, float, float]:
     """Round qty to market precision and return (qty, min_qty, min_notional)."""
     market = {}
@@ -225,19 +288,619 @@ def _ap_mode(state: BotState, key: str) -> str:
         return "manual"
 
 
-def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price_estimate: float,
+def _safe_float(val: Any) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _coerce_bool(val: Any, default: bool = True) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _calc_spread_bps(bid: float, ask: float) -> float:
+    if bid <= 0 or ask <= 0 or ask <= bid:
+        return 0.0
+    mid = (bid + ask) / 2.0
+    return (ask - bid) / mid * 10000.0
+
+
+def _slip_bps_for_notional(levels: List[List[float]], notional_usdt: float, side: str) -> float:
+    if not levels or notional_usdt <= 0:
+        return 0.0
+    try:
+        best = _safe_float(levels[0][0])
+    except Exception:
+        return 0.0
+    if best <= 0:
+        return 0.0
+
+    if side == "buy":
+        remaining = float(notional_usdt)
+        filled_base = 0.0
+        cost = 0.0
+        worst = best
+        for price, amount in levels:
+            if remaining <= 0:
+                break
+            price = _safe_float(price)
+            amount = _safe_float(amount)
+            if price <= 0 or amount <= 0:
+                continue
+            level_cost = price * amount
+            take_cost = min(remaining, level_cost)
+            take_base = take_cost / price
+            cost += take_cost
+            filled_base += take_base
+            remaining -= take_cost
+            worst = price
+        if remaining > 0:
+            bps = SLIPPAGE_FALLBACK_BPS / 10000.0
+            remainder_price = worst * (1 + bps)
+            take_base = remaining / remainder_price if remainder_price > 0 else 0.0
+            cost += remaining
+            filled_base += take_base
+            remaining = 0.0
+        avg = cost / filled_base if filled_base > 0 else best
+        slip_bps = (avg / best - 1.0) * 10000.0
+        return max(0.0, slip_bps)
+
+    # sell
+    base_qty = notional_usdt / best if best > 0 else 0.0
+    remaining = base_qty
+    proceeds = 0.0
+    worst = best
+    for price, amount in levels:
+        if remaining <= 0:
+            break
+        price = _safe_float(price)
+        amount = _safe_float(amount)
+        if price <= 0 or amount <= 0:
+            continue
+        take = min(remaining, amount)
+        proceeds += take * price
+        remaining -= take
+        worst = price
+    if remaining > 0:
+        bps = SLIPPAGE_FALLBACK_BPS / 10000.0
+        remainder_price = worst * (1 - bps)
+        proceeds += remaining * remainder_price
+        remaining = 0.0
+    avg = proceeds / base_qty if base_qty > 0 else best
+    slip_bps = (1.0 - avg / best) * 10000.0
+    return max(0.0, slip_bps)
+
+
+def _get_book_metrics(exchange: ccxt.Exchange, symbol: str, notional_usdt: float) -> Optional[Dict[str, float]]:
+    try:
+        ob = exchange.fetch_order_book(symbol, limit=20)
+    except Exception:
+        return None
+    asks = ob.get("asks") or []
+    bids = ob.get("bids") or []
+    if not asks or not bids:
+        return None
+    best_ask = _safe_float(asks[0][0])
+    best_bid = _safe_float(bids[0][0])
+    spread_bps = _calc_spread_bps(best_bid, best_ask)
+    slip_buy = _slip_bps_for_notional(asks, notional_usdt, "buy")
+    slip_sell = _slip_bps_for_notional(bids, notional_usdt, "sell")
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread_bps": spread_bps,
+        "slip_bps_buy": slip_buy,
+        "slip_bps_sell": slip_sell,
+    }
+
+
+def _coinex_public_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    params = params or {}
+    url = COINEX_API_BASE + path
+    if params:
+        url += "?" + urlencode(params)
+    req = Request(url, headers={"User-Agent": "bot"})
+    try:
+        with urlopen(req, timeout=COINEX_PUBLIC_TIMEOUT_SEC) as resp:
+            payload = json.load(resp) or {}
+    except Exception:
+        return {}
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code not in (0, "0", None):
+            return {}
+    return payload
+
+
+def _coinex_extract_data(payload: Dict[str, Any]) -> Any:
+    if isinstance(payload, dict) and "data" in payload:
+        return payload.get("data")
+    return payload
+
+
+def _coinex_fetch_markets() -> List[Dict[str, Any]]:
+    payload = _coinex_public_get("/spot/market")
+    data = _coinex_extract_data(payload)
+    if isinstance(data, dict):
+        markets = data.get("markets") or data.get("market") or data.get("data") or []
+    else:
+        markets = data or []
+    return markets if isinstance(markets, list) else []
+
+
+def _coinex_fetch_tickers() -> List[Dict[str, Any]]:
+    payload = _coinex_public_get("/spot/ticker")
+    data = _coinex_extract_data(payload)
+    if isinstance(data, dict):
+        raw = data.get("ticker") or data.get("data") or data
+    else:
+        raw = data or []
+    tickers: List[Dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for market, info in raw.items():
+            if not isinstance(info, dict):
+                continue
+            row = dict(info)
+            row.setdefault("market", market)
+            tickers.append(row)
+        return tickers
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                tickers.append(item)
+    return tickers
+
+
+def _ccxt_fetch_tickers(exchange: ccxt.Exchange) -> List[Dict[str, Any]]:
+    try:
+        raw = exchange.fetch_tickers() or {}
+    except Exception:
+        return []
+    tickers: List[Dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for sym, info in raw.items():
+            if not isinstance(info, dict):
+                continue
+            row = dict(info)
+            row.setdefault("market", _symbol_to_market(sym))
+            tickers.append(row)
+        return tickers
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            market = row.get("market") or row.get("symbol") or ""
+            if market:
+                row["market"] = _symbol_to_market(str(market))
+            tickers.append(row)
+    return tickers
+
+
+def _coinex_fetch_depth(market: str, limit: int = 20) -> Tuple[List[List[float]], List[List[float]]]:
+    market = _symbol_to_market(market)
+    payload = _coinex_public_get("/spot/depth", {"market": market, "limit": limit, "interval": "0"})
+    data = _coinex_extract_data(payload)
+    if isinstance(data, dict):
+        asks = data.get("asks") or data.get("sell") or []
+        bids = data.get("bids") or data.get("buy") or []
+    else:
+        asks, bids = [], []
+    clean_asks: List[List[float]] = []
+    for row in asks or []:
+        if not row or len(row) < 2:
+            continue
+        price = _safe_float(row[0])
+        amount = _safe_float(row[1])
+        if price > 0 and amount > 0:
+            clean_asks.append([price, amount])
+
+    clean_bids: List[List[float]] = []
+    for row in bids or []:
+        if not row or len(row) < 2:
+            continue
+        price = _safe_float(row[0])
+        amount = _safe_float(row[1])
+        if price > 0 and amount > 0:
+            clean_bids.append([price, amount])
+    return clean_asks, clean_bids
+
+
+def _coinex_fetch_kline(market: str, limit: int = 120) -> List[Any]:
+    market = _symbol_to_market(market)
+    payload = _coinex_public_get("/spot/kline", {"market": market, "period": "1min", "limit": int(limit)})
+    data = _coinex_extract_data(payload)
+    if isinstance(data, dict):
+        rows = data.get("candles") or data.get("data") or data.get("kline") or []
+    else:
+        rows = data or []
+    return rows if isinstance(rows, list) else []
+
+
+def _parse_kline_row(row: Any) -> Optional[Tuple[float, float, float, float]]:
+    if not isinstance(row, (list, tuple)) or len(row) < 5:
+        return None
+    o = _safe_float(row[1])
+    c1 = _safe_float(row[2])
+    c2 = _safe_float(row[3])
+    c3 = _safe_float(row[4])
+
+    # Format A: [ts, open, high, low, close]
+    high_a, low_a, close_a = c1, c2, c3
+    ok_a = high_a >= max(o, close_a) and low_a <= min(o, close_a) and high_a >= low_a
+
+    # Format B: [ts, open, close, high, low]
+    close_b, high_b, low_b = c1, c2, c3
+    ok_b = high_b >= max(o, close_b) and low_b <= min(o, close_b) and high_b >= low_b
+
+    if ok_b and not ok_a:
+        return o, high_b, low_b, close_b
+    if ok_a and not ok_b:
+        return o, high_a, low_a, close_a
+    if ok_b and ok_a:
+        return o, high_b, low_b, close_b
+    return o, high_b, low_b, close_b
+
+
+def _atr_pct_from_kline(rows: List[Any], lookback: int = 60) -> Tuple[float, float, float]:
+    ranges = []
+    for row in rows[-lookback:]:
+        parsed = _parse_kline_row(row)
+        if not parsed:
+            continue
+        _o, high, low, close = parsed
+        if close <= 0:
+            continue
+        ranges.append((high - low) / close * 100.0)
+    if not ranges:
+        return 0.0, 0.0, 0.0
+    avg_range = statistics.mean(ranges)
+    med_range = statistics.median(ranges)
+    max_range = max(ranges)
+    return float(avg_range), float(med_range), float(max_range)
+
+
+def _symbol_to_market(symbol: str) -> str:
+    return symbol.replace("/", "").upper()
+
+
+def _market_to_symbol(market: str) -> str:
+    market = market.upper()
+    if "/" in market:
+        return market
+    if market.endswith("USDT"):
+        return f"{market[:-4]}/USDT"
+    return market
+
+
+def _build_ticker_items(tickers: List[Dict[str, Any]], allowed_markets: Optional[set]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    items: List[Dict[str, Any]] = []
+    ticker_map: Dict[str, Dict[str, Any]] = {}
+    for t in tickers:
+        market = str(t.get("market") or t.get("symbol") or t.get("market_name") or "").upper()
+        if not market or not market.endswith("USDT"):
+            continue
+        if allowed_markets is not None and market not in allowed_markets:
+            continue
+
+        last = _safe_float(t.get("last") or t.get("close") or t.get("price"))
+        open_ = _safe_float(t.get("open") or t.get("open_24h") or t.get("open_price"))
+        value = _safe_float(t.get("value") or t.get("quote_volume") or t.get("quoteVolume"))
+        if value <= 0:
+            base_vol = _safe_float(t.get("volume") or t.get("vol") or t.get("amount"))
+            if base_vol > 0 and last > 0:
+                value = base_vol * last
+        change = (last / open_ - 1.0) if open_ > 0 else 0.0
+        row = {
+            "market": market,
+            "last": last,
+            "open": open_,
+            "value": value,
+            "change": change,
+        }
+        items.append(row)
+        ticker_map[market] = row
+    return items, ticker_map
+
+
+def _rank_trending_candidates(items: List[Dict[str, Any]], min_value: float, candidates_n: int) -> List[Dict[str, Any]]:
+    filtered = [x for x in items if x.get("value", 0.0) >= min_value]
+    if not filtered:
+        filtered = items
+    if not filtered:
+        return []
+
+    by_value = sorted(filtered, key=lambda x: x.get("value", 0.0), reverse=True)
+    by_change = sorted(filtered, key=lambda x: abs(x.get("change", 0.0)), reverse=True)
+    for idx, item in enumerate(by_value):
+        item["_rank_value"] = idx
+    for idx, item in enumerate(by_change):
+        item["_rank_change"] = idx
+    for item in filtered:
+        item["_rank_sum"] = int(item.get("_rank_value", 0)) + int(item.get("_rank_change", 0))
+    ranked = sorted(filtered, key=lambda x: (x.get("_rank_sum", 0), -x.get("value", 0.0)))
+    return ranked[:max(1, candidates_n)]
+
+
+def _filter_tradable(candidates: List[Dict[str, Any]], min_value: float, spread_max: float,
+                     slip_max: float) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    survivors: List[Dict[str, Any]] = []
+    counts = {"min_value": 0, "depth_fail": 0, "spread": 0, "slippage": 0}
+    depth_samples: List[Dict[str, Any]] = []
+    candidate_metrics: List[Dict[str, Any]] = []
+    for c in candidates:
+        if c.get("value", 0.0) < min_value:
+            counts["min_value"] += 1
+            continue
+        market = c.get("market") or ""
+        asks, bids = _coinex_fetch_depth(market, limit=20)
+        if not asks or not bids:
+            counts["depth_fail"] += 1
+            continue
+        best_ask = _safe_float(asks[0][0])
+        best_bid = _safe_float(bids[0][0])
+        spread_bps = _calc_spread_bps(best_bid, best_ask)
+        slip_buy = _slip_bps_for_notional(asks, AUTO_COIN_NOTIONAL_USDT, "buy")
+        slip_sell = _slip_bps_for_notional(bids, AUTO_COIN_NOTIONAL_USDT, "sell")
+        if len(depth_samples) < 3:
+            depth_samples.append({
+                "market": str(market),
+                "spread_bps": spread_bps,
+                "slip_bps_buy_100": slip_buy,
+            })
+        c_metric = dict(c)
+        c_metric["spread_bps"] = spread_bps
+        c_metric["slip_bps_buy_100"] = slip_buy
+        c_metric["slip_bps_sell_100"] = slip_sell
+        candidate_metrics.append(c_metric)
+        if spread_bps > spread_max:
+            counts["spread"] += 1
+            continue
+        if slip_buy > slip_max:
+            counts["slippage"] += 1
+            continue
+        survivors.append(c_metric)
+    return survivors, counts, depth_samples, candidate_metrics
+
+
+def _score_candidate(c: Dict[str, Any], atr_pct: float, pump_penalty: bool) -> float:
+    value = max(1.0, float(c.get("value", 0.0)))
+    spread_bps = float(c.get("spread_bps", 0.0))
+    slip_bps = float(c.get("slip_bps_buy_100", 0.0))
+    score = 1.5 * atr_pct + 0.3 * math.log10(value) - 0.02 * (spread_bps + slip_bps)
+    if pump_penalty:
+        score *= 0.7
+    return score
+
+
+def _score_single_market(market: str, ticker: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not market:
+        return None
+    asks, bids = _coinex_fetch_depth(market, limit=20)
+    if not asks or not bids:
+        return None
+    best_ask = _safe_float(asks[0][0])
+    best_bid = _safe_float(bids[0][0])
+    spread_bps = _calc_spread_bps(best_bid, best_ask)
+    slip_buy = _slip_bps_for_notional(asks, AUTO_COIN_NOTIONAL_USDT, "buy")
+    slip_sell = _slip_bps_for_notional(bids, AUTO_COIN_NOTIONAL_USDT, "sell")
+
+    rows = _coinex_fetch_kline(market, limit=120)
+    atr_pct, med_range, max_range = _atr_pct_from_kline(rows, lookback=60)
+    pump_penalty = med_range > 0 and max_range > (4.0 * med_range)
+
+    value = float(ticker.get("value", 0.0)) if ticker else 0.0
+    candidate = {
+        "market": market,
+        "value": value,
+        "spread_bps": spread_bps,
+        "slip_bps_buy_100": slip_buy,
+        "slip_bps_sell_100": slip_sell,
+        "atr_pct": atr_pct,
+    }
+    candidate["score"] = _score_candidate(candidate, atr_pct, pump_penalty)
+    return candidate
+
+
+def _scan_coinex_trending(state: BotState, exchange: Optional[ccxt.Exchange] = None) -> Dict[str, Any]:
+    markets = _coinex_fetch_markets()
+    allowed_markets = None
+    if markets:
+        allowed_markets = set()
+        for item in markets:
+            if not isinstance(item, dict):
+                continue
+            market = str(item.get("market") or item.get("symbol") or "").upper()
+            if not market:
+                continue
+            api_ok = _coerce_bool(item.get("is_api_trading_available"), default=True)
+            status = str(item.get("status") or item.get("state") or "online").lower()
+            if api_ok and (not status or status == "online"):
+                allowed_markets.add(market)
+        if not allowed_markets:
+            allowed_markets = None
+
+    tickers = _coinex_fetch_tickers()
+    ticker_source = "coinex"
+    if not tickers and exchange is not None:
+        tickers = _ccxt_fetch_tickers(exchange)
+        ticker_source = "ccxt"
+    items, ticker_map = _build_ticker_items(tickers, allowed_markets)
+    if not items:
+        return {
+            "scored": [],
+            "ui_candidates": [],
+            "best": None,
+            "ticker_map": ticker_map,
+            "relax_next": state.auto_coin_relax_factor,
+            "ticker_source": ticker_source,
+            "tickers_count": len(tickers),
+            "items_count": 0,
+            "candidates_count": 0,
+            "survivors_count": 0,
+            "scored_count": 0,
+            "reject_min_value": 0,
+            "reject_depth_fail": 0,
+            "reject_spread": 0,
+            "reject_slippage": 0,
+            "reject_min_value_candidates": 0,
+            "kline_fail": 0,
+            "depth_samples": [],
+        }
+
+    candidates_n = max(5, int(getattr(state, "auto_coin_candidates_n", AUTO_COIN_CANDIDATES_N_DEFAULT) or AUTO_COIN_CANDIDATES_N_DEFAULT))
+    base_min_value = AUTO_COIN_MIN_VALUE_USDT
+    if sum(1 for x in items if x.get("value", 0.0) >= base_min_value) < max(5, candidates_n):
+        base_min_value = AUTO_COIN_MIN_VALUE_FALLBACK_USDT
+
+    relax = max(1.0, float(getattr(state, "auto_coin_relax_factor", 1.0)))
+    min_value = base_min_value / relax
+    spread_max = AUTO_COIN_SPREAD_BPS_MAX * relax
+    slip_max = AUTO_COIN_SLIP_BPS_MAX * relax
+
+    value_candidates = [x for x in items if x.get("value", 0.0) >= min_value]
+    value_reject = (len(items) - len(value_candidates)) if value_candidates else 0
+
+    candidates = _rank_trending_candidates(items, min_value, candidates_n)
+    survivors, reject_counts, depth_samples, candidate_metrics = _filter_tradable(candidates, min_value, spread_max, slip_max)
+    fallback_used = False
+
+    if not survivors and candidates:
+        # Immediate relax inside the same scan to avoid 0 survivors.
+        relaxed_min_value = max(0.0, min_value * 0.5)
+        relaxed_spread_max = spread_max * 1.5
+        relaxed_slip_max = slip_max * 1.5
+        survivors, _reject2, _depth2, candidate_metrics = _filter_tradable(
+            candidates, relaxed_min_value, relaxed_spread_max, relaxed_slip_max
+        )
+        if survivors:
+            fallback_used = True
+
+    if not survivors and candidate_metrics:
+        # Final fallback: accept depth-ok candidates even if they exceed caps.
+        survivors = candidate_metrics
+        fallback_used = True
+
+    if len(survivors) < 3:
+        relax_next = min(relax * 1.25, 3.0)
+    else:
+        relax_next = 1.0
+
+    scored: List[Dict[str, Any]] = []
+    kline_fail = 0
+    survivors_sorted = sorted(survivors, key=lambda x: x.get("value", 0.0), reverse=True)
+    for c in survivors_sorted[:10]:
+        rows = _coinex_fetch_kline(c.get("market") or "", limit=120)
+        if not rows:
+            kline_fail += 1
+        atr_pct, med_range, max_range = _atr_pct_from_kline(rows, lookback=60)
+        pump_penalty = med_range > 0 and max_range > (4.0 * med_range)
+        c = dict(c)
+        c["atr_pct"] = atr_pct
+        c["score"] = _score_candidate(c, atr_pct, pump_penalty)
+        scored.append(c)
+
+    scored = sorted(scored, key=lambda x: x.get("score", 0.0), reverse=True)
+    best = scored[0] if scored else None
+    ui_candidates: List[Dict[str, Any]] = scored[:5]
+    if not ui_candidates and candidate_metrics:
+        for c in candidate_metrics[:5]:
+            rows = _coinex_fetch_kline(c.get("market") or "", limit=120)
+            if not rows:
+                kline_fail += 1
+            atr_pct, med_range, max_range = _atr_pct_from_kline(rows, lookback=60)
+            pump_penalty = med_range > 0 and max_range > (4.0 * med_range)
+            c = dict(c)
+            c["atr_pct"] = atr_pct
+            c["score"] = _score_candidate(c, atr_pct, pump_penalty)
+            ui_candidates.append(c)
+    if not ui_candidates and candidates:
+        for c in candidates[:5]:
+            c = dict(c)
+            c.setdefault("spread_bps", 0.0)
+            c.setdefault("slip_bps_buy_100", 0.0)
+            c.setdefault("slip_bps_sell_100", 0.0)
+            c.setdefault("atr_pct", 0.0)
+            c.setdefault("score", 0.0)
+            ui_candidates.append(c)
+    return {
+        "scored": scored,
+        "ui_candidates": ui_candidates,
+        "best": best,
+        "ticker_map": ticker_map,
+        "relax_next": relax_next,
+        "tickers_count": len(tickers),
+        "items_count": len(items),
+        "candidates_count": len(candidates),
+        "survivors_count": len(survivors),
+        "scored_count": len(scored),
+        "ticker_source": ticker_source,
+        "reject_min_value": int(value_reject),
+        "reject_depth_fail": int(reject_counts.get("depth_fail", 0)),
+        "reject_spread": int(reject_counts.get("spread", 0)),
+        "reject_slippage": int(reject_counts.get("slippage", 0)),
+        "reject_min_value_candidates": int(reject_counts.get("min_value", 0)),
+        "kline_fail": int(kline_fail),
+        "depth_samples": depth_samples,
+        "fallback_used": bool(fallback_used),
+    }
+
+
+def _format_usdt_value(value: float) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return f"{value:.0f}"
+
+
+def _fmt_duration(seconds: float) -> str:
+    try:
+        seconds = float(seconds)
+    except Exception:
+        return "-"
+    if seconds <= 0:
+        return "0s"
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def place_market_buy(exchange: ccxt.Exchange, state: BotState, cost_usdt: float, price_estimate: float,
                      now: dt.datetime, entry_index: int) -> Optional[Position]:
-    if qty <= 0:
+    if cost_usdt <= 0:
         return None
     symbol = SYMBOL
-    qty, min_qty, min_notional = normalize_qty_for_market(exchange, price_estimate, qty)
-    if qty <= 0 or qty < min_qty or qty * price_estimate < min_notional:
-        log_event(state, f"BUY skipped: qty {qty:.8f} below min (min_qty≈{min_qty:.8f}, min_notional={min_notional:.2f}).")
-        return None
-    use_cap = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
+    use_cap_setting = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
     max_slip_pct = max(0.01, float(getattr(state, "max_slip_pct", MAX_SLIP_PCT_DEFAULT)))
-    best_pre = fetch_best_book_price(exchange, symbol, "buy", price_estimate)
+    force_ioc = (not DRY_RUN and EXCHANGE_NAME.lower() == "coinex")
+    use_cap = True if force_ioc else use_cap_setting
+    book = None
+    if use_cap_setting and not force_ioc:
+        book = _get_book_metrics(exchange, symbol, SMART_MARKET_NOTIONAL_USDT)
+        if book:
+            friction_bps = float(book.get("spread_bps", 0.0) + book.get("slip_bps_buy", 0.0))
+            if friction_bps <= SMART_MARKET_FRICTION_BPS:
+                use_cap = False
+    best_pre = (book or {}).get("best_ask") or fetch_best_book_price(exchange, symbol, "buy", price_estimate)
     limit_price = (best_pre or price_estimate) * (1 + max_slip_pct / 100.0) if use_cap else price_estimate
+    if limit_price <= 0:
+        return None
+    qty = cost_usdt / limit_price
+    qty, min_qty, min_notional = normalize_qty_for_market(exchange, limit_price, qty)
+    if qty <= 0 or qty < min_qty or qty * limit_price < min_notional:
+        log_event(state, f"BUY skipped: qty {qty:.8f} below min (min_qty={min_qty:.8f}, min_notional={min_notional:.2f}).")
+        return None
     attempt = 0
     filled_qty = 0.0
     fill_price = price_estimate
@@ -246,12 +909,14 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
         attempt += 1
         if DRY_RUN:
             if SIMULATE_SLIPPAGE_DRY_RUN:
-                filled_qty, fill_price, best, worst, used = simulate_dry_run_market_fill(
-                    exchange, symbol, "buy", qty, limit_price
-                )
-                # enforce cap in simulation
-                if use_cap and fill_price > limit_price * 1.0000001:
-                    filled_qty = 0.0
+                if use_cap:
+                    filled_qty, fill_price, best, worst, used = simulate_dry_run_ioc_fill(
+                        exchange, symbol, "buy", qty, limit_price
+                    )
+                else:
+                    filled_qty, fill_price, best, worst, used = simulate_dry_run_market_fill(
+                        exchange, symbol, "buy", qty, limit_price
+                    )
                 slip_bps = 0.0
                 if best and best > 0 and filled_qty > 0:
                     slip_bps = (fill_price / best - 1.0) * 10000.0
@@ -265,9 +930,10 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
                         state.last_slippage_ts = time.time()
                 except Exception:
                     pass
+                label = "IOC" if use_cap else "MARKET"
                 log_event(
                     state,
-                    f"IOC BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
+                    f"{label} BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
                     f"(cap={limit_price:.8f}, best={best:.8f}, worst={worst:.8f}, slip={slip_bps:.1f} bps, lvls={used}, attempt={attempt})"
                 )
             else:
@@ -283,7 +949,8 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
                         state.last_slippage_ts = time.time()
                 except Exception:
                     pass
-                log_event(state, f"IOC BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} (cap={limit_price:.8f}, attempt={attempt})")
+                label = "IOC" if use_cap else "MARKET"
+                log_event(state, f"{label} BUY (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} (cap={limit_price:.8f}, attempt={attempt})")
         else:
             try:
                 params = {"timeInForce": "IOC"} if use_cap else {}
@@ -315,16 +982,27 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, qty: float, price
         if filled_qty <= 0 and use_cap and attempt == 1:
             # widen cap by 50% for one retry; last resort fallback to market after loop
             limit_price = (best_pre or price_estimate) * (1 + (max_slip_pct * 1.5) / 100.0)
+            qty = cost_usdt / limit_price
+            qty, min_qty, min_notional = normalize_qty_for_market(exchange, limit_price, qty)
+            if qty <= 0 or qty < min_qty or qty * limit_price < min_notional:
+                log_event(state, f"BUY retry skipped: qty {qty:.8f} below min (min_qty={min_qty:.8f}, min_notional={min_notional:.2f}).")
+                return None
             continue
 
     if filled_qty <= 0 and use_cap:
+        if DRY_RUN:
+            log_event(state, "IOC BUY (DRY_RUN) unfilled after retry; no market fallback in DRY_RUN.")
+            return None
+        if force_ioc:
+            log_event(state, "IOC BUY unfilled after retry; market fallback disabled for CoinEx.")
+            return None
         # final fallback: plain market to avoid missing critical fills
         try:
             order = exchange.create_order(symbol, "market", "buy", qty)
             filled_qty = float(order.get("filled") or order.get("amount") or qty)
             fill_price = float(order.get("average") or order.get("price") or limit_price)
             slip_bps = 0.0
-            if best_pre and best_pre > 0:
+            if best_pre and best_pre > 0 and filled_qty > 0:
                 slip_bps = (fill_price / best_pre - 1.0) * 10000.0
             try:
                 with state.lock:
@@ -371,25 +1049,35 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
     if qty_exit <= 0:
         return 0.0, price_estimate
     symbol = position.symbol
-    use_cap = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
+    use_cap_setting = bool(getattr(state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT))
+    use_cap = use_cap_setting
     max_slip_pct = max(0.01, float(getattr(state, "max_slip_pct", MAX_SLIP_PCT_DEFAULT)))
+    book = None
+    if use_cap_setting:
+        book = _get_book_metrics(exchange, symbol, SMART_MARKET_NOTIONAL_USDT)
+        if book:
+            friction_bps = float(book.get("spread_bps", 0.0) + book.get("slip_bps_sell", 0.0))
+            if friction_bps <= SMART_MARKET_FRICTION_BPS:
+                use_cap = False
     qty_exit, min_qty, min_notional = normalize_qty_for_market(exchange, price_estimate, qty_exit)
     if qty_exit <= 0:
-        log_event(state, f"[WARN] Market SELL skipped: qty normalized to 0 (min_qty≈{min_qty:.8f}).")
+        log_event(state, f"[WARN] Market SELL skipped: qty normalized to 0 (min_qty={min_qty:.8f}).")
         return 0.0, price_estimate
 
     if DRY_RUN:
         if SIMULATE_SLIPPAGE_DRY_RUN:
-            filled_qty, fill_price, best, worst, used = simulate_dry_run_market_fill(
-                exchange, symbol, "sell", qty_exit, price_estimate
-            )
             if use_cap:
                 best_bid = fetch_best_book_price(exchange, symbol, "sell", price_estimate)
                 limit_price = (best_bid or price_estimate) * (1 - max_slip_pct / 100.0)
-                if fill_price < limit_price * 0.999999:
-                    filled_qty = 0.0
+                filled_qty, fill_price, best, worst, used = simulate_dry_run_ioc_fill(
+                    exchange, symbol, "sell", qty_exit, limit_price
+                )
+            else:
+                filled_qty, fill_price, best, worst, used = simulate_dry_run_market_fill(
+                    exchange, symbol, "sell", qty_exit, price_estimate
+                )
             slip_bps = 0.0
-            if best and best > 0:
+            if best and best > 0 and filled_qty > 0:
                 # for sells, worse fill is LOWER than best bid => positive bps
                 slip_bps = (1.0 - fill_price / best) * 10000.0
             try:
@@ -402,9 +1090,10 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
                     state.last_slippage_ts = time.time()
             except Exception:
                 pass
+            label = "IOC" if use_cap else "MARKET"
             log_event(
                 state,
-                f"MARKET SELL (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
+                f"{label} SELL (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f} "
                 f"(book best={best:.8f}, worst={worst:.8f}, slip={slip_bps:.1f} bps, lvls={used})"
             )
             return filled_qty, fill_price
@@ -421,7 +1110,8 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
                     state.last_slippage_ts = time.time()
             except Exception:
                 pass
-            log_event(state, f"MARKET SELL (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f}")
+            label = "IOC" if use_cap else "MARKET"
+            log_event(state, f"{label} SELL (DRY_RUN) {filled_qty:.6f} {symbol.split('/')[0]} @ {fill_price:.8f}")
             return filled_qty, fill_price
 
     base_asset = symbol.split("/")[0]
@@ -443,7 +1133,7 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
         log_event(state, "[WARN] Market SELL skipped: quantity <= 0 after safety margin.")
         return 0.0, price_estimate
 
-    best_pre = fetch_best_book_price(exchange, symbol, "sell", price_estimate)
+    best_pre = (book or {}).get("best_bid") or fetch_best_book_price(exchange, symbol, "sell", price_estimate)
     limit_price = (best_pre or price_estimate) * (1 - max_slip_pct / 100.0) if use_cap else price_estimate
     attempt = 0
     filled_qty = 0.0
@@ -1068,6 +1758,196 @@ def maybe_update_autopilot(exchange: ccxt.Exchange, state: BotState, last_price:
     min_required = (2 * fee_pct) + spread_pct + slip_pct + edge_buffer
     state.effective_edge_floor = min_required  # type: ignore
 
+
+def _force_flat_for_switch(exchange: ccxt.Exchange, state: BotState, last_price: float) -> bool:
+    if state.open_order and state.open_order.status == "open":
+        try:
+            if not state.open_order.simulated and state.open_order.id:
+                exchange.cancel_order(state.open_order.id, SYMBOL)
+        except Exception as e:
+            log_event(state, f"[WARN] Auto-coin cancel failed: {e}")
+        state.open_order.status = "canceled"
+        state.open_order = None
+
+    position = state.position
+    if not position:
+        return True
+
+    price = last_price
+    if price <= 0:
+        try:
+            ticker = exchange.fetch_ticker(SYMBOL) or {}
+            price = float(ticker.get("last") or 0.0)
+        except Exception:
+            price = 0.0
+    if price <= 0:
+        log_event(state, "[WARN] Auto-coin switch blocked: cannot fetch price to close position.")
+        return False
+
+    filled_qty, exit_price = place_market_sell(exchange, state, position, position.qty, price)
+    if filled_qty <= 0:
+        log_event(state, "[WARN] Auto-coin switch blocked: failed to close position.")
+        return False
+
+    pnl = realize_pnl_for_exit(state, position, filled_qty, exit_price)
+    state.daily_realized_pnl += pnl
+    position.last_exit_reason = "auto_coin_switch"
+    log_event(state, f"Auto-coin closed {filled_qty:.6f} @ {exit_price:.8f}, PnL: {pnl:.2f} USDT")
+
+    state.position = None
+    state.status = "WAIT_DIP"
+    state.last_trade_price = exit_price
+    state.last_trade_side = "SELL"
+    state.anchor_timestamp = time.time()
+    state.pending_sell_price = None
+    state.next_trade_time = time.time() + POLL_INTERVAL_SECONDS
+    return True
+
+
+def maybe_update_auto_coin(exchange: ccxt.Exchange, state: BotState, last_price: float,
+                           force_switch: bool = False, ignore_interval: bool = False) -> bool:
+    """Scan CoinEx trending candidates and switch symbols when conditions are met."""
+    if EXCHANGE_NAME.lower() != "coinex":
+        return False
+
+    with state.lock:
+        enabled = bool(getattr(state, "auto_coin_enabled", AUTO_COIN_ENABLED_DEFAULT))
+        scan_interval = float(getattr(state, "auto_coin_scan_interval_sec", AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT))
+        last_scan = float(getattr(state, "auto_coin_last_scan_ts", 0.0))
+        policy = str(getattr(state, "auto_coin_policy", AUTO_COIN_POLICY_DEFAULT) or AUTO_COIN_POLICY_DEFAULT)
+        dwell_min = float(getattr(state, "auto_coin_dwell_min", AUTO_COIN_DWELL_MIN_DEFAULT))
+        hysteresis = float(getattr(state, "auto_coin_hysteresis_pct", AUTO_COIN_HYSTERESIS_PCT_DEFAULT))
+        last_switch = float(getattr(state, "auto_coin_last_switch_ts", 0.0))
+
+    if not enabled and not force_switch and not ignore_interval:
+        return False
+
+    now_ts = time.time()
+    if not ignore_interval and (now_ts - last_scan) < max(10.0, scan_interval):
+        return False
+
+    with state.lock:
+        state.auto_coin_last_scan_ts = now_ts
+
+    result = _scan_coinex_trending(state, exchange)
+    scored = result.get("scored") or []
+    ui_candidates = result.get("ui_candidates") or []
+    best = result.get("best")
+    ticker_map = result.get("ticker_map") or {}
+    relax_next = float(result.get("relax_next", 1.0))
+    tickers_count = int(result.get("tickers_count", 0) or 0)
+    items_count = int(result.get("items_count", 0) or 0)
+    candidates_count = int(result.get("candidates_count", 0) or 0)
+    survivors_count = int(result.get("survivors_count", 0) or 0)
+    scored_count = int(result.get("scored_count", 0) or 0)
+    ticker_source = str(result.get("ticker_source", "coinex") or "coinex")
+    reject_min_value = int(result.get("reject_min_value", 0) or 0)
+    reject_depth_fail = int(result.get("reject_depth_fail", 0) or 0)
+    reject_spread = int(result.get("reject_spread", 0) or 0)
+    reject_slippage = int(result.get("reject_slippage", 0) or 0)
+    reject_min_value_candidates = int(result.get("reject_min_value_candidates", 0) or 0)
+    kline_fail = int(result.get("kline_fail", 0) or 0)
+    depth_samples = result.get("depth_samples") or []
+    fallback_used = bool(result.get("fallback_used", False))
+
+    with state.lock:
+        state.auto_coin_relax_factor = relax_next
+        state.auto_coin_top_candidates = ui_candidates[:5]
+        state.auto_coin_last_scan_info = (
+            f"tickers={tickers_count} items={items_count} candidates={candidates_count} "
+            f"survivors={survivors_count} scored={scored_count} "
+            f"rej[value={reject_min_value}/cand_value={reject_min_value_candidates}/depth={reject_depth_fail}/"
+            f"spread={reject_spread}/slip={reject_slippage}/kline={kline_fail}]"
+        )
+        if fallback_used:
+            state.auto_coin_last_scan_info += " fallback=1"
+
+    if tickers_count == 0:
+        log_event(state, f"Auto-coin scan: no tickers from {ticker_source} API.")
+    else:
+        log_event(
+            state,
+            f"Auto-coin scan: tickers={tickers_count} items={items_count} candidates={candidates_count} "
+            f"survivors={survivors_count} scored={scored_count} "
+            f"rej[value={reject_min_value}/cand_value={reject_min_value_candidates}/depth={reject_depth_fail}/"
+            f"spread={reject_spread}/slip={reject_slippage}/kline={kline_fail}]"
+            f"{' fallback=1' if fallback_used else ''}."
+        )
+        if depth_samples:
+            sample_str = ", ".join(
+                f"{_market_to_symbol(str(s.get('market')))} spread={float(s.get('spread_bps', 0.0)):.1f} bps slip={float(s.get('slip_bps_buy_100', 0.0)):.1f} bps"
+                for s in depth_samples[:3]
+            )
+            log_event(state, f"Auto-coin depth samples: {sample_str}")
+
+    if not best:
+        if force_switch and ui_candidates:
+            best = ui_candidates[0]
+        else:
+            return False
+
+    best_market = str(best.get("market") or "")
+    best_score = float(best.get("score", 0.0))
+    if not best_market:
+        return False
+
+    current_market = _symbol_to_market(SYMBOL)
+    current_score = 0.0
+    for c in scored:
+        if str(c.get("market") or "") == current_market:
+            current_score = float(c.get("score", 0.0))
+            break
+    if current_score <= 0 and current_market:
+        current_info = _score_single_market(current_market, ticker_map.get(current_market))
+        if current_info:
+            current_score = float(current_info.get("score", 0.0))
+
+    with state.lock:
+        state.auto_coin_current_score = current_score
+        if best_market == state.auto_coin_last_winner:
+            state.auto_coin_winner_streak += 1
+        else:
+            state.auto_coin_last_winner = best_market
+            state.auto_coin_winner_streak = 1
+        winner_streak = state.auto_coin_winner_streak
+
+    if best_market == current_market:
+        return False
+    if not force_switch:
+        if winner_streak < 2:
+            return False
+        if dwell_min > 0 and (now_ts - last_switch) < (dwell_min * 60.0):
+            return False
+        if current_score > 0 and best_score < (current_score * (1.0 + hysteresis / 100.0)):
+            return False
+
+    if force_switch:
+        policy = "force"
+    if policy not in ("flat", "force"):
+        policy = "flat"
+
+    if policy == "flat":
+        if state.position is not None or (state.open_order and state.open_order.status == "open"):
+            return False
+    else:
+        if not _force_flat_for_switch(exchange, state, last_price):
+            return False
+
+    new_symbol = _market_to_symbol(best_market)
+    log_event(
+        state,
+        f"Auto-coin switch: {SYMBOL} -> {new_symbol} (ATR%={best.get('atr_pct', 0.0):.2f}, "
+        f"spread={best.get('spread_bps', 0.0):.1f} bps, slip={best.get('slip_bps_buy_100', 0.0):.1f} bps, "
+        f"value={best.get('value', 0.0):.0f}, score={best_score:.2f})"
+    )
+    prev_symbol = SYMBOL
+    change_symbol(exchange, state, new_symbol)
+    if SYMBOL == new_symbol and prev_symbol != new_symbol:
+        with state.lock:
+            state.auto_coin_last_switch_ts = now_ts
+        return True
+    return False
+
 def maybe_refresh_adaptive(exchange: ccxt.Exchange, state: BotState) -> None:
     """Called from trading loop. Keeps effective thresholds updated."""
     with state.lock:
@@ -1249,6 +2129,10 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
     # size
     if DRY_RUN:
         available_usdt = state.sim_balance_usdt
+        if available_usdt <= 0:
+            state.sim_balance_usdt = float(SIMULATED_BALANCE_USDT)
+            available_usdt = state.sim_balance_usdt
+            log_event(state, f"Paper balance reset to {available_usdt:.2f} USDT for DRY_RUN.")
     else:
         try:
             balance = exchange.fetch_balance()
@@ -1267,9 +2151,8 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
         return
 
     if state.order_mode == "market":
-        qty = spend_usdt / last_price
         now = dt.datetime.now(dt.timezone.utc)
-        pos = place_market_buy(exchange, state, qty, last_price, now, last_idx)
+        pos = place_market_buy(exchange, state, spend_usdt, last_price, now, last_idx)
         if not pos:
             return
 
@@ -1694,6 +2577,9 @@ def change_symbol(exchange: ccxt.Exchange, state: BotState, new_symbol: str):
     state.last_candle_ts = None
     state.status = "INIT"
     state.sim_base_qty = 0.0
+    state.dip_wait_start_ts = 0.0
+    state.dip_low = 0.0
+    state.dip_higher_close_count = 0
 
     with state.lock:
         state.chart_times = []
@@ -1781,6 +2667,14 @@ def handle_command(cmd: str, state: BotState, exchange: ccxt.Exchange):
         log_event(state, "Trading RESUMED.")
         return
 
+    if low == "auto_coin_scan":
+        maybe_update_auto_coin(exchange, state, state.last_price or 0.0, force_switch=False, ignore_interval=True)
+        return
+
+    if low == "auto_coin_force":
+        maybe_update_auto_coin(exchange, state, state.last_price or 0.0, force_switch=True, ignore_interval=True)
+        return
+
     if low == "help":
         log_event(state, "Use the fields for BUY/SELL thresholds, set symbol or pick a wallet coin, use buttons for manual orders.")
         return
@@ -1805,6 +2699,10 @@ def handle_command(cmd: str, state: BotState, exchange: ccxt.Exchange):
 
         if DRY_RUN:
             available_usdt = state.sim_balance_usdt
+            if available_usdt <= 0:
+                state.sim_balance_usdt = float(SIMULATED_BALANCE_USDT)
+                available_usdt = state.sim_balance_usdt
+                log_event(state, f"Paper balance reset to {available_usdt:.2f} USDT for DRY_RUN.")
         else:
             try:
                 balance = exchange.fetch_balance()
@@ -1824,9 +2722,8 @@ def handle_command(cmd: str, state: BotState, exchange: ccxt.Exchange):
             log_event(state, f"Manual BUY skipped: not enough USDT (have {available_usdt:.2f}).")
             return
 
-        qty = spend / last_price
         now = dt.datetime.now(dt.timezone.utc)
-        pos = place_market_buy(exchange, state, qty, last_price, now, -1)
+        pos = place_market_buy(exchange, state, spend, last_price, now, -1)
         if not pos:
             return
 
@@ -1972,7 +2869,9 @@ def trading_loop(exchange: ccxt.Exchange, state: BotState, cmd_queue: "queue.Que
             if state.position:
                 manage_position(exchange, state, df)
 
-            if new_candle:
+            switched_symbol = maybe_update_auto_coin(exchange, state, last_price)
+
+            if new_candle and not switched_symbol:
                 state.last_candle_ts = last_ts
                 if not state.position:
                     state.status = "WAIT_DIP"
@@ -2052,17 +2951,21 @@ class BotGUI:
 
         self.tab_trading = ttk.Frame(self.tabs)
         self.tab_adaptive = ttk.Frame(self.tabs)
+        self.tab_trending = ttk.Frame(self.tabs)
         self.tab_toggles = ttk.Frame(self.tabs)
         self.tabs.add(self.tab_trading, text="Trading")
         self.tabs.add(self.tab_adaptive, text="Adaptive")
+        self.tabs.add(self.tab_trending, text="Trending")
         self.tabs.add(self.tab_toggles, text="Toggles")
 
         self._build_status_card(self.tab_trading)
+        self._build_time_card(self.tab_trading)
         self._build_api_card(self.tab_trading)
         self._build_params_card(self.tab_trading)
         self._build_buttons_card(self.tab_trading)
 
         self._build_adaptive_tab(self.tab_adaptive)
+        self._build_trending_tab(self.tab_trending)
         self._build_toggles_tab(self.tab_toggles)
 
 
@@ -2175,6 +3078,36 @@ class BotGUI:
         ttk.Checkbutton(card, variable=self.dry_run_var, command=self._toggle_dry_run).grid(
             row=len(rows), column=1, sticky="w", padx=8, pady=(6, 2)
         )
+
+        card.columnconfigure(1, weight=1)
+
+    def _build_time_card(self, parent):
+        card = self._card(parent, "Time / Timers")
+
+        self.time_now_var = tk.StringVar(value="-")
+        self.time_candle_var = tk.StringVar(value="-")
+        self.time_anchor_var = tk.StringVar(value="-")
+        self.time_dip_var = tk.StringVar(value="-")
+        self.time_cooldown_var = tk.StringVar(value="-")
+        self.time_auto_scan_var = tk.StringVar(value="-")
+        self.time_auto_dwell_var = tk.StringVar(value="-")
+        self.time_adaptive_var = tk.StringVar(value="-")
+        self.time_day_reset_var = tk.StringVar(value="-")
+
+        rows = [
+            ("Now (local)", self.time_now_var),
+            ("Candle age", self.time_candle_var),
+            ("Anchor age", self.time_anchor_var),
+            ("Dip wait", self.time_dip_var),
+            ("Cooldown", self.time_cooldown_var),
+            ("Auto scan", self.time_auto_scan_var),
+            ("Auto dwell", self.time_auto_dwell_var),
+            ("Adaptive refresh", self.time_adaptive_var),
+            ("Day reset (UTC)", self.time_day_reset_var),
+        ]
+        for r, (lbl, var) in enumerate(rows):
+            ttk.Label(card, text=lbl + ":").grid(row=r, column=0, sticky="w", padx=8, pady=2)
+            ttk.Label(card, textvariable=var).grid(row=r, column=1, sticky="w", padx=8, pady=2)
 
         card.columnconfigure(1, weight=1)
 
@@ -2469,43 +3402,37 @@ class BotGUI:
         ttk.Checkbutton(card, variable=self.soft_stop_toggle_var, command=self._on_toggle_soft_stop).grid(
             row=2, column=1, sticky="w", padx=8, pady=(8, 2)
         )
-        ttk.Label(card, text="Soft stop confirms (# closes)").grid(row=3, column=0, sticky="w", padx=8, pady=(2, 2))
-        self.soft_stop_confirms_var = tk.StringVar(value=str(getattr(self.state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT)))
-        e_conf = ttk.Entry(card, textvariable=self.soft_stop_confirms_var, width=10)
-        e_conf.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 2))
-        e_conf.bind("<Return>", self._on_soft_stop_confirms)
-        e_conf.bind("<FocusOut>", self._on_soft_stop_confirms)
         ttk.Label(
             card,
             text="Soft stop waits for multiple closes under stop to avoid wick-outs; hard stop hits deeper drop immediately.",
             wraplength=self.SIDEBAR_WIDTH - 60,
             justify="left",
             foreground="#666",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
 
         self.dip_rebound_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_dip_rebound", True)))
-        ttk.Label(card, text="Dip → bounce confirmation").grid(row=5, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(card, text="Dip ?+' bounce confirmation").grid(row=4, column=0, sticky="w", padx=8, pady=(4, 2))
         ttk.Checkbutton(card, variable=self.dip_rebound_toggle_var, command=self._on_toggle_dip_rebound).grid(
-            row=5, column=1, sticky="w", padx=8, pady=(4, 2)
+            row=4, column=1, sticky="w", padx=8, pady=(4, 2)
         )
-        ttk.Label(card, text="Rebound confirm %").grid(row=6, column=0, sticky="w", padx=8, pady=(2, 2))
+        ttk.Label(card, text="Rebound confirm %").grid(row=5, column=0, sticky="w", padx=8, pady=(2, 2))
         self.rebound_confirm_var = tk.StringVar(value=f"{getattr(self.state, 'rebound_confirm_pct', REBOUND_CONFIRM_PCT_DEFAULT):.3f}")
         e_reb = ttk.Entry(card, textvariable=self.rebound_confirm_var, width=10)
-        e_reb.grid(row=6, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_reb.grid(row=5, column=1, sticky="w", padx=8, pady=(2, 2))
         e_reb.bind("<Return>", self._on_rebound_confirm_pct)
         e_reb.bind("<FocusOut>", self._on_rebound_confirm_pct)
 
-        ttk.Label(card, text="Rebound timeout (sec)").grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
+        ttk.Label(card, text="Rebound timeout (sec)").grid(row=6, column=0, sticky="w", padx=8, pady=(2, 2))
         self.rebound_timeout_var = tk.StringVar(value=f"{getattr(self.state, 'dip_rebound_timeout_sec', DIP_REBOUND_TIMEOUT_SEC_DEFAULT):.0f}")
         e_rt = ttk.Entry(card, textvariable=self.rebound_timeout_var, width=10)
-        e_rt.grid(row=7, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_rt.grid(row=6, column=1, sticky="w", padx=8, pady=(2, 2))
         e_rt.bind("<Return>", self._on_rebound_timeout)
         e_rt.bind("<FocusOut>", self._on_rebound_timeout)
 
-        ttk.Label(card, text="Higher closes to confirm").grid(row=8, column=0, sticky="w", padx=8, pady=(2, 2))
+        ttk.Label(card, text="Higher closes to confirm").grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
         self.rebound_confirms_var = tk.StringVar(value=str(getattr(self.state, "dip_confirm_closes", DIP_CONFIRM_CLOSES_DEFAULT)))
         e_rc = ttk.Entry(card, textvariable=self.rebound_confirms_var, width=10)
-        e_rc.grid(row=8, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_rc.grid(row=7, column=1, sticky="w", padx=8, pady=(2, 2))
         e_rc.bind("<Return>", self._on_rebound_confirms)
         e_rc.bind("<FocusOut>", self._on_rebound_confirms)
 
@@ -2515,12 +3442,12 @@ class BotGUI:
             wraplength=self.SIDEBAR_WIDTH - 60,
             justify="left",
             foreground="#666",
-        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
 
         self.edge_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_edge_aware_thresholds", USE_EDGE_AWARE_THRESHOLDS_DEFAULT)))
-        ttk.Label(card, text="Edge-aware thresholds").grid(row=10, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(card, text="Edge-aware thresholds").grid(row=9, column=0, sticky="w", padx=8, pady=(4, 2))
         ttk.Checkbutton(card, variable=self.edge_toggle_var, command=self._on_toggle_edge_aware).grid(
-            row=10, column=1, sticky="w", padx=8, pady=(4, 2)
+            row=9, column=1, sticky="w", padx=8, pady=(4, 2)
         )
         ttk.Label(
             card,
@@ -2528,27 +3455,20 @@ class BotGUI:
             wraplength=self.SIDEBAR_WIDTH - 60,
             justify="left",
             foreground="#666",
-        ).grid(row=11, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 10))
 
         self.ioc_toggle_var = tk.BooleanVar(value=bool(getattr(self.state, "use_ioc_slippage_cap", USE_IOC_SLIPPAGE_CAP_DEFAULT)))
-        ttk.Label(card, text="IOC with slippage cap").grid(row=12, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(card, text="IOC with slippage cap").grid(row=11, column=0, sticky="w", padx=8, pady=(4, 2))
         ttk.Checkbutton(card, variable=self.ioc_toggle_var, command=self._on_toggle_ioc_cap).grid(
-            row=12, column=1, sticky="w", padx=8, pady=(4, 2)
+            row=11, column=1, sticky="w", padx=8, pady=(4, 2)
         )
-        ttk.Label(card, text="Max slip % (over best bid/ask)").grid(row=13, column=0, sticky="w", padx=8, pady=(2, 2))
-        self.max_slip_var = tk.StringVar(value=f"{getattr(self.state, 'max_slip_pct', MAX_SLIP_PCT_DEFAULT):.3f}")
-        e_ms = ttk.Entry(card, textvariable=self.max_slip_var, width=10)
-        e_ms.grid(row=13, column=1, sticky="w", padx=8, pady=(2, 2))
-        e_ms.bind("<Return>", self._on_max_slip_pct)
-        e_ms.bind("<FocusOut>", self._on_max_slip_pct)
-
         ttk.Label(
             card,
-            text="Use IOC limits with a slip cap to avoid runaway market fills; retries once, then fallback to market as last resort.",
+            text="Use IOC limits with a slip cap to avoid runaway market fills; adjust max slip in Autopilot.",
             wraplength=self.SIDEBAR_WIDTH - 60,
             justify="left",
             foreground="#666",
-        ).grid(row=14, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        ).grid(row=12, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
         card.columnconfigure(1, weight=1)
 
         # Autopilot controls
@@ -2578,14 +3498,107 @@ class BotGUI:
         ttk.Label(ap_card, text="Auto").grid(row=0, column=3, padx=4)
         ttk.Label(ap_card, text="Effective").grid(row=0, column=4, padx=4)
 
-        _ap_row(1, "Trail %", "trail_pct", ".3f")
-        _ap_row(2, "TP1 fraction", "tp1_frac", ".3f")
-        _ap_row(3, "Soft stop closes", "soft_stop_confirms", ".0f")
-        _ap_row(4, "Hard stop x", "hard_stop_mult", ".2f")
-        _ap_row(5, "Stop %", "stop_pct", ".3f")
-        _ap_row(6, "Max slip %", "max_slip_pct", ".3f")
+        _ap_row(1, "Auto BUY %", "auto_buy_pct", ".3f")
+        _ap_row(2, "Trail %", "trail_pct", ".3f")
+        _ap_row(3, "TP1 fraction", "tp1_frac", ".3f")
+        _ap_row(4, "Soft stop closes", "soft_stop_confirms", ".0f")
+        _ap_row(5, "Hard stop x", "hard_stop_mult", ".2f")
+        _ap_row(6, "Stop %", "stop_pct", ".3f")
+        _ap_row(7, "Max slip %", "max_slip_pct", ".3f")
         for c in range(5):
             ap_card.columnconfigure(c, weight=1)
+
+    def _build_trending_tab(self, parent):
+        card = self._card(parent, "Auto Coin (Trending Scanner)")
+
+        self.auto_coin_enabled_var = tk.BooleanVar(value=bool(getattr(self.state, "auto_coin_enabled", AUTO_COIN_ENABLED_DEFAULT)))
+        ttk.Label(card, text="Auto Coin (CoinEx Trending Scanner)").grid(row=0, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Checkbutton(card, variable=self.auto_coin_enabled_var, command=self._on_auto_coin_toggle).grid(
+            row=0, column=1, sticky="w", padx=8, pady=(4, 2)
+        )
+
+        ttk.Label(card, text="Switch policy").grid(row=1, column=0, sticky="w", padx=8, pady=(6, 2))
+        policy_default = "Switch only when flat"
+        if str(getattr(self.state, "auto_coin_policy", AUTO_COIN_POLICY_DEFAULT)) == "force":
+            policy_default = "Force close then switch"
+        self.auto_coin_policy_var = tk.StringVar(value=policy_default)
+        policy_combo = ttk.Combobox(
+            card,
+            values=["Switch only when flat", "Force close then switch"],
+            state="readonly",
+            width=24,
+            textvariable=self.auto_coin_policy_var,
+        )
+        policy_combo.grid(row=1, column=1, sticky="w", padx=8, pady=(6, 2))
+        policy_combo.bind("<<ComboboxSelected>>", self._on_auto_coin_policy)
+
+        ttk.Label(card, text="Scan interval (sec)").grid(row=2, column=0, sticky="w", padx=8, pady=(4, 2))
+        self.auto_coin_scan_var = tk.StringVar(value=f"{float(getattr(self.state, 'auto_coin_scan_interval_sec', AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT)):.0f}")
+        e_scan = ttk.Entry(card, textvariable=self.auto_coin_scan_var, width=10)
+        e_scan.grid(row=2, column=1, sticky="w", padx=8, pady=(4, 2))
+        e_scan.bind("<Return>", self._on_auto_coin_scan_interval)
+        e_scan.bind("<FocusOut>", self._on_auto_coin_scan_interval)
+
+        ttk.Label(card, text="Min dwell (min)").grid(row=3, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.auto_coin_dwell_var = tk.StringVar(value=f"{float(getattr(self.state, 'auto_coin_dwell_min', AUTO_COIN_DWELL_MIN_DEFAULT)):.0f}")
+        e_dwell = ttk.Entry(card, textvariable=self.auto_coin_dwell_var, width=10)
+        e_dwell.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_dwell.bind("<Return>", self._on_auto_coin_dwell)
+        e_dwell.bind("<FocusOut>", self._on_auto_coin_dwell)
+
+        ttk.Label(card, text="Hysteresis %").grid(row=4, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.auto_coin_hyst_var = tk.StringVar(value=f"{float(getattr(self.state, 'auto_coin_hysteresis_pct', AUTO_COIN_HYSTERESIS_PCT_DEFAULT)):.1f}")
+        e_hyst = ttk.Entry(card, textvariable=self.auto_coin_hyst_var, width=10)
+        e_hyst.grid(row=4, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_hyst.bind("<Return>", self._on_auto_coin_hysteresis)
+        e_hyst.bind("<FocusOut>", self._on_auto_coin_hysteresis)
+
+        ttk.Label(card, text="Candidates N").grid(row=5, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.auto_coin_candidates_var = tk.StringVar(value=str(int(getattr(self.state, "auto_coin_candidates_n", AUTO_COIN_CANDIDATES_N_DEFAULT))))
+        e_cand = ttk.Entry(card, textvariable=self.auto_coin_candidates_var, width=10)
+        e_cand.grid(row=5, column=1, sticky="w", padx=8, pady=(2, 2))
+        e_cand.bind("<Return>", self._on_auto_coin_candidates)
+        e_cand.bind("<FocusOut>", self._on_auto_coin_candidates)
+
+        ttk.Separator(card).grid(row=6, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 6))
+
+        ttk.Label(card, text="Current symbol").grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.auto_coin_symbol_var = tk.StringVar(value=SYMBOL)
+        ttk.Label(card, textvariable=self.auto_coin_symbol_var).grid(row=7, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        ttk.Label(card, text="Last scan").grid(row=8, column=0, sticky="w", padx=8, pady=(2, 6))
+        self.auto_coin_last_scan_var = tk.StringVar(value="-")
+        ttk.Label(card, textvariable=self.auto_coin_last_scan_var).grid(row=8, column=1, sticky="w", padx=8, pady=(2, 6))
+
+        ttk.Label(card, text="Last scan summary").grid(row=9, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.auto_coin_summary_var = tk.StringVar(value="-")
+        ttk.Label(card, textvariable=self.auto_coin_summary_var).grid(row=9, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        ttk.Label(card, text="Top candidates").grid(row=10, column=0, sticky="w", padx=8, pady=(2, 2))
+        cols = ("symbol", "atr", "spread", "slip", "value", "score")
+        self.auto_coin_table = ttk.Treeview(card, columns=cols, show="headings", height=5)
+        self.auto_coin_table.heading("symbol", text="Symbol")
+        self.auto_coin_table.heading("atr", text="ATR%")
+        self.auto_coin_table.heading("spread", text="Spread bps")
+        self.auto_coin_table.heading("slip", text="Slip bps")
+        self.auto_coin_table.heading("value", text="24h value")
+        self.auto_coin_table.heading("score", text="Score")
+        self.auto_coin_table.column("symbol", width=80, anchor="w")
+        self.auto_coin_table.column("atr", width=60, anchor="e")
+        self.auto_coin_table.column("spread", width=80, anchor="e")
+        self.auto_coin_table.column("slip", width=70, anchor="e")
+        self.auto_coin_table.column("value", width=80, anchor="e")
+        self.auto_coin_table.column("score", width=60, anchor="e")
+        self.auto_coin_table.grid(row=11, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 6))
+
+        ttk.Button(card, text="Scan now", command=self._on_auto_coin_scan).grid(
+            row=12, column=0, sticky="ew", padx=8, pady=(2, 6)
+        )
+        ttk.Button(card, text="Force switch now", command=self._on_auto_coin_force).grid(
+            row=12, column=1, sticky="ew", padx=8, pady=(2, 6)
+        )
+
+        card.columnconfigure(1, weight=1)
 
     def _sync_tf_selection(self, tfs: List[str]):
         try:
@@ -2859,9 +3872,10 @@ class BotGUI:
         symbol_frame.grid(row=0, column=1, sticky="nsew", padx=3)
         self.symbol_var = tk.StringVar(value=SYMBOL)
         ttk.Label(symbol_frame, text="Symbol (e.g. ENA/USDT)").pack(anchor="w", padx=8, pady=(6, 2))
-        sym_entry = ttk.Entry(symbol_frame, textvariable=self.symbol_var)
-        sym_entry.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Button(symbol_frame, text="Set Symbol", command=self.on_set_symbol).pack(
+        self.symbol_entry = ttk.Entry(symbol_frame, textvariable=self.symbol_var)
+        self.symbol_entry.pack(fill="x", padx=8, pady=(0, 4))
+        self.set_symbol_btn = ttk.Button(symbol_frame, text="Set Symbol", command=self.on_set_symbol)
+        self.set_symbol_btn.pack(
             fill="x", padx=8, pady=(0, 6)
         )
 
@@ -2871,7 +3885,8 @@ class BotGUI:
         ttk.Label(wallet_sel_frame, text="Coin").pack(anchor="w", padx=8, pady=(6, 2))
         self.wallet_coin_combo = ttk.Combobox(wallet_sel_frame, values=[], state="readonly", width=10)
         self.wallet_coin_combo.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Button(wallet_sel_frame, text="Use Wallet Coin", command=self.on_use_wallet_coin).pack(
+        self.wallet_coin_btn = ttk.Button(wallet_sel_frame, text="Use Wallet Coin", command=self.on_use_wallet_coin)
+        self.wallet_coin_btn.pack(
             fill="x", padx=8, pady=(0, 6)
         )
     # ---------- callbacks ----------
@@ -2906,19 +3921,6 @@ class BotGUI:
             self.state.soft_stop_counter = 0
         save_settings(self.state)
         log_event(self.state, f"Soft stop {'ENABLED' if want else 'DISABLED'} (hard stop always active when SL set)")
-
-    def _on_soft_stop_confirms(self, event=None):
-        raw = self.soft_stop_confirms_var.get().strip()
-        try:
-            v = max(1, int(float(raw)))
-        except Exception:
-            return
-        with self.state.lock:
-            self.state.soft_stop_confirms = v
-            self.state.soft_stop_counter = 0
-        self.soft_stop_confirms_var.set(str(v))
-        save_settings(self.state)
-        log_event(self.state, f"Soft stop confirms set to {v} closes below stop")
 
     def _on_toggle_dip_rebound(self):
         want = bool(self.dip_rebound_toggle_var.get())
@@ -2980,17 +3982,81 @@ class BotGUI:
         save_settings(self.state)
         log_event(self.state, f"IOC slippage cap {'ENABLED' if want else 'DISABLED'}")
 
-    def _on_max_slip_pct(self, event=None):
-        raw = self.max_slip_var.get().strip()
+    def _on_auto_coin_toggle(self):
+        want = bool(self.auto_coin_enabled_var.get())
+        with self.state.lock:
+            self.state.auto_coin_enabled = want
+            if want:
+                self.state.auto_coin_last_scan_ts = 0.0
+                self.state.auto_coin_last_winner = ""
+                self.state.auto_coin_winner_streak = 0
+                self.state.auto_coin_top_candidates = []
+        save_settings(self.state)
+        log_event(self.state, f"Auto-coin scanner {'ENABLED' if want else 'DISABLED'}")
+
+    def _on_auto_coin_policy(self, event=None):
+        label = str(self.auto_coin_policy_var.get())
+        policy = "force" if label.lower().startswith("force") else "flat"
+        with self.state.lock:
+            self.state.auto_coin_policy = policy
+        save_settings(self.state)
+        log_event(self.state, f"Auto-coin policy set to {policy}.")
+
+    def _on_auto_coin_scan_interval(self, event=None):
+        raw = self.auto_coin_scan_var.get().strip()
         try:
-            v = max(0.01, float(raw))
+            v = max(10.0, float(raw))
         except Exception:
             return
         with self.state.lock:
-            self.state.max_slip_pct = v
-        self.max_slip_var.set(f"{v:.3f}")
+            self.state.auto_coin_scan_interval_sec = v
+        self.auto_coin_scan_var.set(f"{v:.0f}")
         save_settings(self.state)
-        log_event(self.state, f"Max slip pct set to {v:.3f}%")
+        log_event(self.state, f"Auto-coin scan interval set to {v:.0f}s.")
+
+    def _on_auto_coin_dwell(self, event=None):
+        raw = self.auto_coin_dwell_var.get().strip()
+        try:
+            v = max(0.0, float(raw))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.auto_coin_dwell_min = v
+        self.auto_coin_dwell_var.set(f"{v:.0f}")
+        save_settings(self.state)
+        log_event(self.state, f"Auto-coin min dwell set to {v:.0f}m.")
+
+    def _on_auto_coin_hysteresis(self, event=None):
+        raw = self.auto_coin_hyst_var.get().strip()
+        try:
+            v = max(0.0, float(raw))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.auto_coin_hysteresis_pct = v
+        self.auto_coin_hyst_var.set(f"{v:.1f}")
+        save_settings(self.state)
+        log_event(self.state, f"Auto-coin hysteresis set to {v:.1f}%.")
+
+    def _on_auto_coin_candidates(self, event=None):
+        raw = self.auto_coin_candidates_var.get().strip()
+        try:
+            v = max(5, int(float(raw)))
+        except Exception:
+            return
+        with self.state.lock:
+            self.state.auto_coin_candidates_n = v
+        self.auto_coin_candidates_var.set(str(v))
+        save_settings(self.state)
+        log_event(self.state, f"Auto-coin candidates N set to {v}.")
+
+    def _on_auto_coin_scan(self):
+        self.send_cmd("auto_coin_scan")
+        log_event(self.state, "Auto-coin scan requested.")
+
+    def _on_auto_coin_force(self):
+        self.send_cmd("auto_coin_force")
+        log_event(self.state, "Auto-coin force switch requested.")
 
     def _on_autopilot_mode(self, key: str, var: tk.StringVar):
         mode = var.get().strip().lower()
@@ -3031,6 +4097,14 @@ class BotGUI:
                 self.state.soft_stop_confirms = int(round(v))
             elif key == "hard_stop_mult":
                 self.state.effective_hard_stop_mult = v
+            elif key == "stop_pct":
+                self.state.stop_loss_effective_pct = v
+                globals().__setitem__("STOP_LOSS_PCT", v)
+            elif key == "auto_buy_pct":
+                self.state.auto_buy_pct = max(0.0, min(v / 100.0, 1.0))
+                self.state.auto_buy_pct_effective = self.state.auto_buy_pct
+                if hasattr(self, "auto_buy_pct_var"):
+                    self.auto_buy_pct_var.set(f"{self.state.auto_buy_pct * 100.0:.1f}")
             elif key == "max_slip_pct":
                 self.state.max_slip_pct = v
         var.set(f"{v:.3f}")
@@ -3085,6 +4159,15 @@ class BotGUI:
         v = max(0.0, min(v, 100.0))
         self.state.auto_buy_pct = v / 100.0
         self.auto_buy_pct_var.set(f"{v:.1f}")
+        try:
+            ap = _get_ap(self.state, "auto_buy_pct", v)
+            ap.manual = v
+            ap.last_manual_ts = time.time()
+            if ap.mode == "manual":
+                ap.effective = v
+            self.state.autopilot["auto_buy_pct"] = ap
+        except Exception:
+            pass
         save_settings(self.state)
 
     def on_manual_buy_entry(self, event=None):
@@ -3141,6 +4224,16 @@ class BotGUI:
                 STOP_LOSS_PCT = max(0.0, float(sl))
             except ValueError:
                 pass
+        try:
+            self.state.stop_loss_effective_pct = STOP_LOSS_PCT
+            ap = _get_ap(self.state, "stop_pct", float(STOP_LOSS_PCT or 0.0))
+            ap.manual = float(STOP_LOSS_PCT or 0.0)
+            ap.last_manual_ts = time.time()
+            if ap.mode == "manual":
+                ap.effective = ap.manual
+            self.state.autopilot["stop_pct"] = ap
+        except Exception:
+            pass
 
         for (var, setter) in [
             (self.daily_loss_var, lambda x: globals().__setitem__("DAILY_MAX_LOSS_USDT", float(x))),
@@ -3289,6 +4382,24 @@ class BotGUI:
             sim_balance_usdt = s.sim_balance_usdt
             chart_times = list(s.chart_times)
             chart_close = list(s.chart_close)
+            auto_coin_enabled = bool(getattr(s, "auto_coin_enabled", AUTO_COIN_ENABLED_DEFAULT))
+            auto_coin_last_scan_ts = float(getattr(s, "auto_coin_last_scan_ts", 0.0))
+            auto_coin_top_candidates = list(getattr(s, "auto_coin_top_candidates", []) or [])
+            auto_coin_policy = str(getattr(s, "auto_coin_policy", AUTO_COIN_POLICY_DEFAULT))
+            auto_coin_last_scan_info = str(getattr(s, "auto_coin_last_scan_info", "") or "")
+            anchor_ts = s.anchor_timestamp
+            dip_wait_start_ts = s.dip_wait_start_ts
+            dip_timeout_sec = float(getattr(s, "dip_rebound_timeout_sec", DIP_REBOUND_TIMEOUT_SEC_DEFAULT))
+            paused_until = s.trading_paused_until
+            paused_reason = s.paused_reason
+            next_trade_time = s.next_trade_time
+            last_candle_ts = s.last_candle_ts
+            day_start_date = s.day_start_date
+            data_refresh_sec = float(getattr(s, "data_refresh_sec", DATA_REFRESH_SEC_DEFAULT))
+            last_data_refresh_ts = float(getattr(s, "_last_data_refresh_ts", 0.0))
+            auto_coin_scan_interval_sec = float(getattr(s, "auto_coin_scan_interval_sec", AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT))
+            auto_coin_last_switch_ts = float(getattr(s, "auto_coin_last_switch_ts", 0.0))
+            auto_coin_dwell_min = float(getattr(s, "auto_coin_dwell_min", AUTO_COIN_DWELL_MIN_DEFAULT))
 
         self.root.title(f"{SYMBOL} · Auto Scalper")
         self.status_var.set(status)
@@ -3324,11 +4435,6 @@ class BotGUI:
                     self.soft_stop_toggle_var.set(bool(getattr(s, "use_soft_stop", True)))
                 except Exception:
                     pass
-            if hasattr(self, "soft_stop_confirms_var"):
-                try:
-                    self.soft_stop_confirms_var.set(str(int(getattr(s, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT))))
-                except Exception:
-                    pass
             if hasattr(self, "dip_rebound_toggle_var"):
                 try:
                     self.dip_rebound_toggle_var.set(bool(use_dip_rebound))
@@ -3359,11 +4465,6 @@ class BotGUI:
                     self.ioc_toggle_var.set(bool(use_ioc_cap))
                 except Exception:
                     pass
-            if hasattr(self, "max_slip_var"):
-                try:
-                    self.max_slip_var.set(f"{float(getattr(s, 'max_slip_pct', MAX_SLIP_PCT_DEFAULT)):.3f}")
-                except Exception:
-                    pass
             if hasattr(self, "ap_controls"):
                 defaults_map = {
                     "trail_pct": getattr(self.state, "effective_trail_pct", TRAIL_STOP_PCT),
@@ -3385,6 +4486,141 @@ class BotGUI:
                             vars_map["entry"].configure(state="disabled" if ap.mode == "auto" else "normal")
                     except Exception:
                         continue
+        except Exception:
+            pass
+
+        # Auto coin UI + symbol controls
+        try:
+            if hasattr(self, "auto_coin_enabled_var"):
+                self.auto_coin_enabled_var.set(bool(auto_coin_enabled))
+            if hasattr(self, "auto_coin_policy_var"):
+                policy_label = "Force close then switch" if auto_coin_policy == "force" else "Switch only when flat"
+                self.auto_coin_policy_var.set(policy_label)
+            if hasattr(self, "auto_coin_symbol_var"):
+                badge = " (Auto)" if auto_coin_enabled else ""
+                self.auto_coin_symbol_var.set(f"{SYMBOL}{badge}")
+            if hasattr(self, "auto_coin_last_scan_var"):
+                if auto_coin_last_scan_ts > 0:
+                    ts = dt.datetime.fromtimestamp(auto_coin_last_scan_ts)
+                    self.auto_coin_last_scan_var.set(ts.strftime("%H:%M:%S"))
+                else:
+                    self.auto_coin_last_scan_var.set("-")
+            if hasattr(self, "auto_coin_summary_var"):
+                self.auto_coin_summary_var.set(auto_coin_last_scan_info if auto_coin_last_scan_info else "-")
+            if hasattr(self, "auto_coin_table"):
+                for row in self.auto_coin_table.get_children():
+                    self.auto_coin_table.delete(row)
+                for c in auto_coin_top_candidates[:5]:
+                    sym = _market_to_symbol(str(c.get("market") or ""))
+                    atr = float(c.get("atr_pct") or 0.0)
+                    spread = float(c.get("spread_bps") or 0.0)
+                    slip = float(c.get("slip_bps_buy_100") or 0.0)
+                    value = float(c.get("value") or 0.0)
+                    score = float(c.get("score") or 0.0)
+                    self.auto_coin_table.insert(
+                        "",
+                        "end",
+                        values=(sym, f"{atr:.2f}", f"{spread:.0f}", f"{slip:.0f}", _format_usdt_value(value), f"{score:.2f}"),
+                    )
+            if hasattr(self, "symbol_entry"):
+                st = "disabled" if auto_coin_enabled else "normal"
+                self.symbol_entry.configure(state=st)
+                if hasattr(self, "set_symbol_btn"):
+                    self.set_symbol_btn.configure(state=st)
+                if hasattr(self, "wallet_coin_combo"):
+                    self.wallet_coin_combo.configure(state="disabled" if auto_coin_enabled else "readonly")
+                if hasattr(self, "wallet_coin_btn"):
+                    self.wallet_coin_btn.configure(state=st)
+                try:
+                    focused = self.root.focus_get() == self.symbol_entry
+                except Exception:
+                    focused = False
+                if auto_coin_enabled or not focused:
+                    self.symbol_var.set(SYMBOL)
+        except Exception:
+            pass
+
+        # Time / timers
+        try:
+            now_ts = time.time()
+            self.time_now_var.set(dt.datetime.now().strftime("%H:%M:%S"))
+
+            if last_candle_ts:
+                candle_age = max(0.0, now_ts - (float(last_candle_ts) / 1000.0))
+                self.time_candle_var.set(f"{_fmt_duration(candle_age)} ({TIMEFRAME})")
+            else:
+                self.time_candle_var.set("-")
+
+            if anchor_ts:
+                age = max(0.0, now_ts - float(anchor_ts))
+                self.time_anchor_var.set(f"{_fmt_duration(age)} / {_fmt_duration(ANCHOR_MAX_AGE_SEC)}")
+            else:
+                self.time_anchor_var.set("-")
+
+            if use_dip_rebound and dip_wait_start_ts and dip_wait_start_ts > 0:
+                elapsed = max(0.0, now_ts - float(dip_wait_start_ts))
+                timeout = max(1.0, float(dip_timeout_sec))
+                remaining = max(0.0, timeout - elapsed)
+                self.time_dip_var.set(f"{_fmt_duration(elapsed)} / {_fmt_duration(timeout)} (rem {_fmt_duration(remaining)})")
+            elif use_dip_rebound:
+                self.time_dip_var.set("-")
+            else:
+                self.time_dip_var.set("disabled")
+
+            cooldown_str = "-"
+            if paused_until and now_ts < float(paused_until):
+                remaining = max(0.0, float(paused_until) - now_ts)
+                reason = str(paused_reason or "").strip()
+                if reason:
+                    cooldown_str = f"{_fmt_duration(remaining)} ({reason})"
+                else:
+                    cooldown_str = _fmt_duration(remaining)
+            elif next_trade_time and now_ts < float(next_trade_time):
+                remaining = max(0.0, float(next_trade_time) - now_ts)
+                cooldown_str = f"{_fmt_duration(remaining)} (trade)"
+            self.time_cooldown_var.set(cooldown_str)
+
+            if auto_coin_enabled:
+                if auto_coin_last_scan_ts > 0:
+                    last_age = max(0.0, now_ts - auto_coin_last_scan_ts)
+                    next_in = max(0.0, auto_coin_scan_interval_sec - last_age)
+                    self.time_auto_scan_var.set(f"next {_fmt_duration(next_in)} (last {_fmt_duration(last_age)} ago)")
+                else:
+                    self.time_auto_scan_var.set(f"next {_fmt_duration(auto_coin_scan_interval_sec)}")
+
+                if auto_coin_last_switch_ts > 0:
+                    dwell_total = max(0.0, auto_coin_dwell_min * 60.0)
+                    dwell_elapsed = max(0.0, now_ts - auto_coin_last_switch_ts)
+                    dwell_remaining = max(0.0, dwell_total - dwell_elapsed)
+                    if dwell_remaining > 0:
+                        self.time_auto_dwell_var.set(_fmt_duration(dwell_remaining))
+                    else:
+                        self.time_auto_dwell_var.set("ready")
+                else:
+                    self.time_auto_dwell_var.set("ready")
+            else:
+                self.time_auto_scan_var.set("-")
+                self.time_auto_dwell_var.set("-")
+
+            if data_driven:
+                refresh_sec = data_refresh_sec
+                if profile in ADAPTIVE_PRESETS and profile != "Custom":
+                    refresh_sec = float(ADAPTIVE_PRESETS[profile]["refresh"])
+                if last_data_refresh_ts > 0:
+                    age = max(0.0, now_ts - last_data_refresh_ts)
+                    self.time_adaptive_var.set(f"{_fmt_duration(age)} ago / {_fmt_duration(refresh_sec)}")
+                else:
+                    self.time_adaptive_var.set(f"every {_fmt_duration(refresh_sec)}")
+            else:
+                self.time_adaptive_var.set("-")
+
+            if isinstance(day_start_date, dt.date):
+                now_utc = dt.datetime.now(dt.timezone.utc)
+                next_day = dt.datetime.combine(day_start_date + dt.timedelta(days=1), dt.time(0, 0, tzinfo=dt.timezone.utc))
+                remaining = max(0.0, (next_day - now_utc).total_seconds())
+                self.time_day_reset_var.set(_fmt_duration(remaining))
+            else:
+                self.time_day_reset_var.set("-")
         except Exception:
             pass
 
@@ -3600,6 +4836,31 @@ def run_bot():
                     state.dip_confirm_closes = max(1, int(settings["dip_confirm_closes"]))
                 except Exception:
                     state.dip_confirm_closes = config.DIP_CONFIRM_CLOSES_DEFAULT
+            if "auto_coin_enabled" in settings:
+                state.auto_coin_enabled = bool(settings["auto_coin_enabled"])
+            if "auto_coin_policy" in settings:
+                policy = str(settings["auto_coin_policy"] or AUTO_COIN_POLICY_DEFAULT).lower()
+                state.auto_coin_policy = policy if policy in ("flat", "force") else AUTO_COIN_POLICY_DEFAULT
+            if "auto_coin_scan_interval_sec" in settings:
+                try:
+                    state.auto_coin_scan_interval_sec = max(10.0, float(settings["auto_coin_scan_interval_sec"]))
+                except Exception:
+                    state.auto_coin_scan_interval_sec = AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT
+            if "auto_coin_dwell_min" in settings:
+                try:
+                    state.auto_coin_dwell_min = max(0.0, float(settings["auto_coin_dwell_min"]))
+                except Exception:
+                    state.auto_coin_dwell_min = AUTO_COIN_DWELL_MIN_DEFAULT
+            if "auto_coin_hysteresis_pct" in settings:
+                try:
+                    state.auto_coin_hysteresis_pct = max(0.0, float(settings["auto_coin_hysteresis_pct"]))
+                except Exception:
+                    state.auto_coin_hysteresis_pct = AUTO_COIN_HYSTERESIS_PCT_DEFAULT
+            if "auto_coin_candidates_n" in settings:
+                try:
+                    state.auto_coin_candidates_n = max(5, int(float(settings["auto_coin_candidates_n"])))
+                except Exception:
+                    state.auto_coin_candidates_n = AUTO_COIN_CANDIDATES_N_DEFAULT
             if "autopilot" in settings and isinstance(settings["autopilot"], dict):
                 for k, v in settings["autopilot"].items():
                     try:
