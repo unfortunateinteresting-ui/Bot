@@ -50,6 +50,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
 
+from bot_app import config
 from bot_app.config import *
 from bot_app.exchange_utils import (
     fetch_best_book_price,
@@ -66,6 +67,7 @@ COINEX_PUBLIC_TIMEOUT_SEC = 8.0
 AUTO_COIN_NOTIONAL_USDT = 100.0
 SMART_MARKET_FRICTION_BPS = 120.0
 SMART_MARKET_NOTIONAL_USDT = 100.0
+PRICE_SANITY_MAX_RATIO = 10.0
 
 
 ################################################################
@@ -310,6 +312,13 @@ def _calc_spread_bps(bid: float, ask: float) -> float:
     return (ask - bid) / mid * 10000.0
 
 
+def _price_ratio_too_wide(a: float, b: float, max_ratio: float = PRICE_SANITY_MAX_RATIO) -> bool:
+    if a <= 0 or b <= 0:
+        return False
+    ratio = max(a / b, b / a)
+    return ratio > max_ratio
+
+
 def _slip_bps_for_notional(levels: List[List[float]], notional_usdt: float, side: str) -> float:
     if not levels or notional_usdt <= 0:
         return 0.0
@@ -487,8 +496,9 @@ def _coinex_fetch_depth(market: str, limit: int = 20) -> Tuple[List[List[float]]
     payload = _coinex_public_get("/spot/depth", {"market": market, "limit": limit, "interval": "0"})
     data = _coinex_extract_data(payload)
     if isinstance(data, dict):
-        asks = data.get("asks") or data.get("sell") or []
-        bids = data.get("bids") or data.get("buy") or []
+        depth = data.get("depth") if isinstance(data.get("depth"), dict) else data
+        asks = depth.get("asks") or depth.get("sell") or []
+        bids = depth.get("bids") or depth.get("buy") or []
     else:
         asks, bids = [], []
     clean_asks: List[List[float]] = []
@@ -523,6 +533,14 @@ def _coinex_fetch_kline(market: str, limit: int = 120) -> List[Any]:
 
 
 def _parse_kline_row(row: Any) -> Optional[Tuple[float, float, float, float]]:
+    if isinstance(row, dict):
+        o = _safe_float(row.get("open") or row.get("open_price"))
+        high = _safe_float(row.get("high") or row.get("high_price"))
+        low = _safe_float(row.get("low") or row.get("low_price"))
+        close = _safe_float(row.get("close") or row.get("close_price"))
+        if close <= 0 or high <= 0 or low <= 0:
+            return None
+        return o, high, low, close
     if not isinstance(row, (list, tuple)) or len(row) < 5:
         return None
     o = _safe_float(row[1])
@@ -582,17 +600,31 @@ def _build_ticker_items(tickers: List[Dict[str, Any]], allowed_markets: Optional
     items: List[Dict[str, Any]] = []
     ticker_map: Dict[str, Dict[str, Any]] = {}
     for t in tickers:
+        info = t.get("info") if isinstance(t, dict) else None
+        info = info if isinstance(info, dict) else {}
         market = str(t.get("market") or t.get("symbol") or t.get("market_name") or "").upper()
         if not market or not market.endswith("USDT"):
             continue
         if allowed_markets is not None and market not in allowed_markets:
             continue
 
-        last = _safe_float(t.get("last") or t.get("close") or t.get("price"))
-        open_ = _safe_float(t.get("open") or t.get("open_24h") or t.get("open_price"))
-        value = _safe_float(t.get("value") or t.get("quote_volume") or t.get("quoteVolume"))
+        last = _safe_float(
+            t.get("last") or t.get("close") or t.get("price") or
+            info.get("last") or info.get("last_price") or info.get("close") or info.get("close_price")
+        )
+        open_ = _safe_float(
+            t.get("open") or t.get("open_24h") or t.get("open_price") or
+            info.get("open") or info.get("open_price") or info.get("open_24h")
+        )
+        value = _safe_float(
+            t.get("value") or t.get("quote_volume") or t.get("quoteVolume") or
+            info.get("value") or info.get("quote_volume") or info.get("quoteVolume")
+        )
         if value <= 0:
-            base_vol = _safe_float(t.get("volume") or t.get("vol") or t.get("amount"))
+            base_vol = _safe_float(
+                t.get("baseVolume") or t.get("volume") or t.get("vol") or t.get("amount") or
+                info.get("baseVolume") or info.get("volume") or info.get("vol") or info.get("amount")
+            )
             if base_vol > 0 and last > 0:
                 value = base_vol * last
         change = (last / open_ - 1.0) if open_ > 0 else 0.0
@@ -672,7 +704,11 @@ def _score_candidate(c: Dict[str, Any], atr_pct: float, pump_penalty: bool) -> f
     value = max(1.0, float(c.get("value", 0.0)))
     spread_bps = float(c.get("spread_bps", 0.0))
     slip_bps = float(c.get("slip_bps_buy_100", 0.0))
-    score = 1.5 * atr_pct + 0.3 * math.log10(value) - 0.02 * (spread_bps + slip_bps)
+    score = (
+        AUTO_COIN_SCORE_ATR_WEIGHT * atr_pct
+        + AUTO_COIN_SCORE_VALUE_WEIGHT * math.log10(value)
+        - AUTO_COIN_SCORE_FRICTION_WEIGHT * (spread_bps + slip_bps)
+    )
     if pump_penalty:
         score *= 0.7
     return score
@@ -806,6 +842,12 @@ def _scan_coinex_trending(state: BotState, exchange: Optional[ccxt.Exchange] = N
         scored.append(c)
 
     scored = sorted(scored, key=lambda x: x.get("score", 0.0), reverse=True)
+    atr_min = float(AUTO_COIN_MIN_ATR_PCT)
+    atr_filtered = [c for c in scored if float(c.get("atr_pct", 0.0)) >= atr_min] if atr_min > 0 else []
+    atr_filter_used = False
+    if atr_min > 0 and atr_filtered:
+        scored = atr_filtered
+        atr_filter_used = True
     best = scored[0] if scored else None
     ui_candidates: List[Dict[str, Any]] = scored[:5]
     if not ui_candidates and candidate_metrics:
@@ -834,6 +876,8 @@ def _scan_coinex_trending(state: BotState, exchange: Optional[ccxt.Exchange] = N
         "best": best,
         "ticker_map": ticker_map,
         "relax_next": relax_next,
+        "atr_min": atr_min,
+        "atr_filter_used": atr_filter_used,
         "tickers_count": len(tickers),
         "items_count": len(items),
         "candidates_count": len(candidates),
@@ -1019,6 +1063,13 @@ def place_market_buy(exchange: ccxt.Exchange, state: BotState, cost_usdt: float,
             log_event(state, f"[ERROR] Market BUY fallback error: {e}")
             return None
 
+    if DRY_RUN and filled_qty > 0 and _price_ratio_too_wide(fill_price, price_estimate):
+        log_event(
+            state,
+            f"[WARN] DRY_RUN BUY ignored: fill {fill_price:.8f} vs last {price_estimate:.8f} exceeds sanity ratio."
+        )
+        return None
+
     cost_notional = filled_qty * fill_price
     entry_fee = cost_notional * TAKER_FEE
 
@@ -1080,6 +1131,12 @@ def place_market_sell(exchange: ccxt.Exchange, state: BotState, position: Positi
             if best and best > 0 and filled_qty > 0:
                 # for sells, worse fill is LOWER than best bid => positive bps
                 slip_bps = (1.0 - fill_price / best) * 10000.0
+            if _price_ratio_too_wide(fill_price, price_estimate):
+                log_event(
+                    state,
+                    f"[WARN] DRY_RUN SELL ignored: fill {fill_price:.8f} vs last {price_estimate:.8f} exceeds sanity ratio."
+                )
+                return 0.0, price_estimate
             try:
                 with state.lock:
                     state.last_slippage_bps = float(slip_bps)
@@ -1880,16 +1937,11 @@ def maybe_update_auto_coin(exchange: ccxt.Exchange, state: BotState, last_price:
             )
             log_event(state, f"Auto-coin depth samples: {sample_str}")
 
-    if not best:
-        if force_switch and ui_candidates:
-            best = ui_candidates[0]
-        else:
-            return False
+    if not best and force_switch and ui_candidates:
+        best = ui_candidates[0]
 
-    best_market = str(best.get("market") or "")
-    best_score = float(best.get("score", 0.0))
-    if not best_market:
-        return False
+    best_market = str(best.get("market") or "") if best else ""
+    best_score = float(best.get("score", 0.0)) if best else 0.0
 
     current_market = _symbol_to_market(SYMBOL)
     current_score = 0.0
@@ -1902,24 +1954,29 @@ def maybe_update_auto_coin(exchange: ccxt.Exchange, state: BotState, last_price:
         if current_info:
             current_score = float(current_info.get("score", 0.0))
 
+    winner_streak = 0
     with state.lock:
         state.auto_coin_current_score = current_score
-        if best_market == state.auto_coin_last_winner:
-            state.auto_coin_winner_streak += 1
-        else:
-            state.auto_coin_last_winner = best_market
-            state.auto_coin_winner_streak = 1
-        winner_streak = state.auto_coin_winner_streak
+        if best_market:
+            if best_market == state.auto_coin_last_winner:
+                state.auto_coin_winner_streak += 1
+            else:
+                state.auto_coin_last_winner = best_market
+                state.auto_coin_winner_streak = 1
+            winner_streak = state.auto_coin_winner_streak
 
-    if best_market == current_market:
-        return False
+    block_reasons: List[str] = []
+    if not best_market:
+        block_reasons.append("no_best")
+    elif best_market == current_market:
+        block_reasons.append("same_symbol")
     if not force_switch:
         if winner_streak < 2:
-            return False
+            block_reasons.append("not_consecutive")
         if dwell_min > 0 and (now_ts - last_switch) < (dwell_min * 60.0):
-            return False
+            block_reasons.append("dwell")
         if current_score > 0 and best_score < (current_score * (1.0 + hysteresis / 100.0)):
-            return False
+            block_reasons.append("hysteresis")
 
     if force_switch:
         policy = "force"
@@ -1928,9 +1985,25 @@ def maybe_update_auto_coin(exchange: ccxt.Exchange, state: BotState, last_price:
 
     if policy == "flat":
         if state.position is not None or (state.open_order and state.open_order.status == "open"):
-            return False
-    else:
+            block_reasons.append("not_flat")
+
+    delta_str = "n/a"
+    if current_score > 0:
+        delta_pct = (best_score - current_score) / current_score * 100.0
+        delta_str = f"{delta_pct:+.1f}%"
+    reason_str = "switch" if not block_reasons else ",".join(block_reasons)
+    log_event(
+        state,
+        f"Auto-coin decision: best={_market_to_symbol(best_market) if best_market else '-'}({best_score:.2f}) "
+        f"current={SYMBOL}({current_score:.2f}) delta={delta_str} reason={reason_str}"
+    )
+
+    if block_reasons:
+        return False
+
+    if policy == "force":
         if not _force_flat_for_switch(exchange, state, last_price):
+            log_event(state, "Auto-coin decision: force_close_failed")
             return False
 
     new_symbol = _market_to_symbol(best_market)
@@ -2569,6 +2642,7 @@ def change_symbol(exchange: ccxt.Exchange, state: BotState, new_symbol: str):
         return
 
     SYMBOL = new_symbol
+    config.SYMBOL = new_symbol
     state.last_trade_price = None
     state.last_trade_side = None
     state.anchor_timestamp = None
@@ -2632,6 +2706,34 @@ def handle_command(cmd: str, state: BotState, exchange: ccxt.Exchange):
                 seed = state.wallet_equity if state.wallet_equity > 0 else SIMULATED_BALANCE_USDT
                 state.sim_balance_usdt = float(seed)
         log_event(state, f"DRY RUN set to {want}.")
+        save_settings(state)
+        return
+
+    if low == "reset_dry_run":
+        if not state.dry_run:
+            log_event(state, "[WARN] Dry-run reset ignored: DRY RUN is OFF.")
+            return
+        with state.lock:
+            state.sim_balance_usdt = float(SIMULATED_BALANCE_USDT)
+            state.sim_base_qty = 0.0
+            state.daily_realized_pnl = 0.0
+            state.total_realized_pnl = 0.0
+            state.position = None
+            state.open_order = None
+            state.last_trade_price = None
+            state.last_trade_side = None
+            state.anchor_timestamp = None
+            state.pending_buy_price = None
+            state.pending_sell_price = None
+            state.last_candle_ts = None
+            state.soft_stop_counter = 0
+            state.dip_wait_start_ts = 0.0
+            state.dip_low = 0.0
+            state.dip_higher_close_count = 0
+            state.trading_paused_until = None
+            state.paused_reason = None
+            state.status = "INIT"
+        log_event(state, f"Dry-run reset: balance={SIMULATED_BALANCE_USDT:.2f} USDT, PnL cleared.")
         save_settings(state)
         return
 
@@ -3078,6 +3180,8 @@ class BotGUI:
         ttk.Checkbutton(card, variable=self.dry_run_var, command=self._toggle_dry_run).grid(
             row=len(rows), column=1, sticky="w", padx=8, pady=(6, 2)
         )
+        self.reset_dry_run_btn = ttk.Button(card, text="Reset Dry-Run PnL + Balance", command=self._on_reset_dry_run)
+        self.reset_dry_run_btn.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 2))
 
         card.columnconfigure(1, weight=1)
 
@@ -3590,12 +3694,23 @@ class BotGUI:
         self.auto_coin_table.column("value", width=80, anchor="e")
         self.auto_coin_table.column("score", width=60, anchor="e")
         self.auto_coin_table.grid(row=11, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 6))
+        self.auto_coin_table.bind("<<TreeviewSelect>>", self._on_auto_coin_table_select)
+
+        ttk.Label(card, text="Manual select").grid(row=12, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.auto_coin_select_var = tk.StringVar(value="")
+        self.auto_coin_select_combo = ttk.Combobox(
+            card, textvariable=self.auto_coin_select_var, values=[], state="readonly", width=20
+        )
+        self.auto_coin_select_combo.grid(row=12, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        self.auto_coin_switch_btn = ttk.Button(card, text="Switch to selected", command=self._on_auto_coin_manual_switch)
+        self.auto_coin_switch_btn.grid(row=13, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 6))
 
         ttk.Button(card, text="Scan now", command=self._on_auto_coin_scan).grid(
-            row=12, column=0, sticky="ew", padx=8, pady=(2, 6)
+            row=14, column=0, sticky="ew", padx=8, pady=(2, 6)
         )
         ttk.Button(card, text="Force switch now", command=self._on_auto_coin_force).grid(
-            row=12, column=1, sticky="ew", padx=8, pady=(2, 6)
+            row=14, column=1, sticky="ew", padx=8, pady=(2, 6)
         )
 
         card.columnconfigure(1, weight=1)
@@ -3907,6 +4022,9 @@ class BotGUI:
         want = bool(self.dry_run_var.get())
         self.cmd_queue.put(f"dry_run:{1 if want else 0}")
 
+    def _on_reset_dry_run(self):
+        self.cmd_queue.put("reset_dry_run")
+
     def _on_toggle_tp1_trailing(self):
         want = bool(self.tp1_toggle_var.get())
         with self.state.lock:
@@ -4057,6 +4175,27 @@ class BotGUI:
     def _on_auto_coin_force(self):
         self.send_cmd("auto_coin_force")
         log_event(self.state, "Auto-coin force switch requested.")
+
+    def _on_auto_coin_table_select(self, event=None):
+        try:
+            if not hasattr(self, "auto_coin_table") or not hasattr(self, "auto_coin_select_var"):
+                return
+            sel = self.auto_coin_table.selection()
+            if not sel:
+                return
+            values = self.auto_coin_table.item(sel[0], "values") or []
+            sym = str(values[0]).strip() if values else ""
+            if sym:
+                self.auto_coin_select_var.set(sym)
+        except Exception:
+            pass
+
+    def _on_auto_coin_manual_switch(self):
+        sym = ""
+        if hasattr(self, "auto_coin_select_var"):
+            sym = self.auto_coin_select_var.get().strip()
+        if sym:
+            self.send_cmd(f"symbol:{sym}")
 
     def _on_autopilot_mode(self, key: str, var: tk.StringVar):
         mode = var.get().strip().lower()
@@ -4489,6 +4628,13 @@ class BotGUI:
         except Exception:
             pass
 
+        # Enable dry-run reset button only when in DRY_RUN
+        try:
+            if hasattr(self, "reset_dry_run_btn"):
+                self.reset_dry_run_btn.configure(state="normal" if dry_run else "disabled")
+        except Exception:
+            pass
+
         # Auto coin UI + symbol controls
         try:
             if hasattr(self, "auto_coin_enabled_var"):
@@ -4522,6 +4668,29 @@ class BotGUI:
                         "end",
                         values=(sym, f"{atr:.2f}", f"{spread:.0f}", f"{slip:.0f}", _format_usdt_value(value), f"{score:.2f}"),
                     )
+            if hasattr(self, "auto_coin_select_combo") and hasattr(self, "auto_coin_select_var"):
+                symbols: List[str] = []
+                for c in auto_coin_top_candidates[:10]:
+                    sym = _market_to_symbol(str(c.get("market") or ""))
+                    if sym and sym not in symbols:
+                        symbols.append(sym)
+                if SYMBOL and SYMBOL not in symbols:
+                    symbols.insert(0, SYMBOL)
+                self.auto_coin_select_combo.configure(values=symbols)
+                current = self.auto_coin_select_var.get().strip()
+                if current not in symbols:
+                    if symbols:
+                        self.auto_coin_select_var.set(symbols[0])
+                    else:
+                        self.auto_coin_select_var.set("")
+                select_state = "disabled" if auto_coin_enabled else "readonly"
+                try:
+                    self.auto_coin_select_combo.configure(state=select_state)
+                except Exception:
+                    pass
+                if hasattr(self, "auto_coin_switch_btn"):
+                    btn_state = "disabled" if auto_coin_enabled or not symbols else "normal"
+                    self.auto_coin_switch_btn.configure(state=btn_state)
             if hasattr(self, "symbol_entry"):
                 st = "disabled" if auto_coin_enabled else "normal"
                 self.symbol_entry.configure(state=st)
@@ -4750,6 +4919,7 @@ def run_bot():
     try:
         if settings.get("symbol"):
             SYMBOL = str(settings["symbol"]).upper().strip()
+            config.SYMBOL = SYMBOL
     except Exception:
         pass
 
