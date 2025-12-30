@@ -319,6 +319,78 @@ def _price_ratio_too_wide(a: float, b: float, max_ratio: float = PRICE_SANITY_MA
     return ratio > max_ratio
 
 
+def _ema_series(series: pd.Series, period: int) -> pd.Series:
+    period = max(2, int(period))
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
+
+
+def _rsi_series(series: pd.Series, period: int) -> pd.Series:
+    period = max(2, int(period))
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _parse_roi_table(text: str) -> List[Tuple[int, float]]:
+    table: List[Tuple[int, float]] = []
+    for chunk in str(text or "").split(","):
+        part = chunk.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            continue
+        left, right = part.split(":", 1)
+        try:
+            minutes = int(float(left.strip()))
+            roi = float(right.strip())
+        except Exception:
+            continue
+        if minutes < 0 or roi < 0:
+            continue
+        table.append((minutes, roi))
+    table.sort(key=lambda x: x[0])
+    return table
+
+
+def _roi_target_for_age(age_min: float, table: List[Tuple[int, float]]) -> float:
+    target = 0.0
+    for minutes, roi in table:
+        if age_min >= minutes:
+            target = roi
+    return max(0.0, target)
+
+
+def _ft_last_indicators(df: pd.DataFrame, state: BotState) -> Optional[Dict[str, float]]:
+    if df is None or df.empty:
+        return None
+    close = df["close"].astype(float)
+    volume = df["volume"].astype(float)
+    if close.empty or volume.empty:
+        return None
+    ema_fast = _ema_series(close, getattr(state, "ft_ema_fast", config.FT_EMA_FAST_DEFAULT))
+    ema_slow = _ema_series(close, getattr(state, "ft_ema_slow", config.FT_EMA_SLOW_DEFAULT))
+    rsi = _rsi_series(close, getattr(state, "ft_rsi_period", config.FT_RSI_PERIOD_DEFAULT))
+    vol_period = max(2, int(getattr(state, "ft_vol_period", config.FT_VOL_PERIOD_DEFAULT)))
+    vol_sma = volume.rolling(window=vol_period, min_periods=vol_period).mean()
+    if ema_fast.empty or ema_slow.empty or rsi.empty or vol_sma.empty:
+        return None
+    values = {
+        "ema_fast": float(ema_fast.iloc[-1]),
+        "ema_slow": float(ema_slow.iloc[-1]),
+        "rsi": float(rsi.iloc[-1]),
+        "volume": float(volume.iloc[-1]),
+        "vol_sma": float(vol_sma.iloc[-1]),
+    }
+    for v in values.values():
+        if not math.isfinite(v):
+            return None
+    return values
+
+
 def _slip_bps_for_notional(levels: List[List[float]], notional_usdt: float, side: str) -> float:
     if not levels or notional_usdt <= 0:
         return 0.0
@@ -1567,12 +1639,49 @@ def _atr_per_min_pct(exchange: ccxt.Exchange, symbol: str, timeframe: str, lookb
     atr_per_min = atr_pct / (minutes ** 0.5)
     return atr_per_min, df
 
-def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dict[str, Any]:
-    """Compute effective BUY/SELL thresholds using multi-horizon volatility + trend.
+def _avg_rise_fall_per_min_pct(exchange: ccxt.Exchange, symbol: str, timeframe: str, lookback: int) -> Tuple[float, float, pd.DataFrame]:
+    """Compute average up/down candle body % (close-open) and normalize per-minute."""
+    lb = max(30, int(lookback))
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=max(lb + 5, 80))
+    if not ohlcv:
+        raise RuntimeError(f"No OHLCV returned for {timeframe}")
 
-    - For each selected timeframe, we compute a robust TR% (ATR-like) and normalize it to a per-minute scale.
+    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+    df["open"] = df["open"].astype(float)
+    df["close"] = df["close"].astype(float)
+
+    denom = df["open"].replace(0.0, 1e-9)
+    body_pct = (df["close"] - df["open"]) / denom * 100.0
+    body_pct = body_pct.replace([float("inf"), float("-inf")], 0.0)
+
+    # Robustify: clip extreme bodies so outliers don't dominate.
+    try:
+        cap = float(body_pct.abs().quantile(0.90))
+        if cap > 0:
+            body_pct = body_pct.clip(lower=-cap, upper=cap)
+    except Exception:
+        pass
+
+    body_pct = body_pct.tail(lb)
+    up = float(body_pct[body_pct > 0].mean()) if not body_pct.empty else 0.0
+    down = float((-body_pct[body_pct < 0]).mean()) if not body_pct.empty else 0.0
+    abs_mean = float(body_pct.abs().mean()) if not body_pct.empty else 0.0
+
+    if not math.isfinite(up) or up <= 0:
+        up = abs_mean
+    if not math.isfinite(down) or down <= 0:
+        down = abs_mean
+
+    minutes = float(_tf_to_minutes(timeframe))
+    scale = minutes ** 0.5
+    return up / scale, down / scale, df
+
+def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dict[str, Any]:
+    """Compute effective BUY/SELL thresholds using multi-horizon average moves + trend.
+
+    - For each selected timeframe, we compute average up/down candle bodies and normalize them per-minute.
     - We blend horizons with preset/custom weights.
-    - Convert blended volatility into BUY/SELL thresholds via k_buy/k_sell, then apply trend multipliers.
+    - Convert blended down moves into BUY thresholds and blended up moves into SELL thresholds.
     """
     with state.lock:
         profile = str(getattr(state, "adaptive_profile", ADAPTIVE_PROFILE_DEFAULT) or ADAPTIVE_PROFILE_DEFAULT)
@@ -1599,20 +1708,31 @@ def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dic
     if len(weights) != len(timeframes) or not weights:
         weights = _derive_weights(timeframes, None)
 
-    # Compute per-horizon volatility
-    vols: List[float] = []
+    # Compute per-horizon average up/down moves
+    vols_up: List[float] = []
+    vols_down: List[float] = []
     dfs: Dict[str, pd.DataFrame] = {}
     for tf in timeframes:
-        v, df_tf = _atr_per_min_pct(exchange, SYMBOL, tf, lookback)
-        vols.append(max(0.0, float(v)))
+        try:
+            up, down, df_tf = _avg_rise_fall_per_min_pct(exchange, SYMBOL, tf, lookback)
+        except Exception:
+            v, df_tf = _atr_per_min_pct(exchange, SYMBOL, tf, lookback)
+            up = v
+            down = v
+        vols_up.append(max(0.0, float(up)))
+        vols_down.append(max(0.0, float(down)))
         dfs[tf] = df_tf
 
-    blended_v = 0.0
+    blended_up = 0.0
+    blended_down = 0.0
     wsum = 0.0
-    for w, v in zip(weights, vols):
-        blended_v += float(w) * float(v)
+    for w, up, down in zip(weights, vols_up, vols_down):
+        blended_up += float(w) * float(up)
+        blended_down += float(w) * float(down)
         wsum += float(w)
-    blended_v = blended_v / (wsum or 1.0)
+    blended_up = blended_up / (wsum or 1.0)
+    blended_down = blended_down / (wsum or 1.0)
+    blended_v = (blended_up + blended_down) * 0.5
 
     # Trend on the *slowest* selected timeframe (stable regime signal)
     trend_tf = sorted(timeframes, key=lambda x: _tf_to_minutes(x))[-1]
@@ -1633,9 +1753,9 @@ def compute_adaptive_thresholds(exchange: ccxt.Exchange, state: BotState) -> Dic
     avg_high = float(df_tr["high"].astype(float).tail(lookback).mean()) if df_tr is not None and not df_tr.empty else 0.0
     avg_low = float(df_tr["low"].astype(float).tail(lookback).mean()) if df_tr is not None and not df_tr.empty else 0.0
 
-    # Convert volatility (per-minute %) into effective thresholds
-    raw_buy = max(0.0, blended_v) * k_buy
-    raw_sell = max(0.0, blended_v) * k_sell
+    # Convert average moves (per-minute %) into effective thresholds
+    raw_buy = max(0.0, blended_down) * k_buy
+    raw_sell = max(0.0, blended_up) * k_sell
 
     # Edge-aware clamp to cover costs (fees + spread + slippage + buffer)
     fee_bps = max(0.0, TAKER_FEE * 10000.0)
@@ -2113,91 +2233,132 @@ def maybe_open_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFra
     last_idx = len(df) - 1
     buy_thr = (state.effective_buy_threshold_pct if state.data_driven else state.buy_threshold_pct)
 
-    if state.last_trade_price is None or state.last_trade_side is None:
-        state.last_trade_price = last_price
-        state.last_trade_side = "SELL"
-        state.anchor_timestamp = now_ts
-        state.status = "WAIT_DIP"
-        state.dip_wait_start_ts = 0.0
-        state.dip_low = 0.0
-        state.dip_higher_close_count = 0
-        buy_trigger = state.last_trade_price * (1 - buy_thr / 100.0)
-        state.pending_buy_price = buy_trigger
-        log_event(state, f"Initialized. Waiting for dip: BUY trigger at {buy_trigger:.8f}")
-        return
+    use_ft_signals = bool(getattr(state, "ft_signal_only", config.FT_SIGNAL_ONLY_DEFAULT)) and bool(
+        getattr(state, "ft_enabled", config.FT_LOGIC_ENABLED_DEFAULT)
+    )
 
-    if state.last_trade_side != "SELL":
-        return
-
-    age = (now_ts - state.anchor_timestamp) if state.anchor_timestamp is not None else None
-    price_above_anchor = last_price > state.last_trade_price * (1 + ANCHOR_DRIFT_REARM_PCT / 100.0)
-
-    if (age is not None and age > ANCHOR_MAX_AGE_SEC) or price_above_anchor:
-        old_anchor = state.last_trade_price
-        state.last_trade_price = last_price
-        state.anchor_timestamp = now_ts
+    if use_ft_signals:
         state.pending_buy_price = None
         state.dip_wait_start_ts = 0.0
         state.dip_low = 0.0
         state.dip_higher_close_count = 0
-        log_event(state, f"Re-anchoring BUY reference {old_anchor:.8f} -> {last_price:.8f} (age={0 if age is None else age:.0f}s).")
 
-    buy_trigger_price = state.last_trade_price * (1 - buy_thr / 100.0)
-
-    if state.pending_buy_price is None or abs(buy_trigger_price - state.pending_buy_price) > 1e-12:
-        state.pending_buy_price = buy_trigger_price
-        # keep log quieter; comment back in if you want it noisy:
-        # log_event(state, f"New BUY trigger set at {buy_trigger_price:.8f} (waiting for dip)")
-
-    use_rebound = bool(getattr(state, "use_dip_rebound", True))
-    rebound_pct = max(0.0, float(getattr(state, "rebound_confirm_pct", REBOUND_CONFIRM_PCT_DEFAULT)))
-    rebound_timeout = max(5.0, float(getattr(state, "dip_rebound_timeout_sec", DIP_REBOUND_TIMEOUT_SEC_DEFAULT)))
-    confirm_closes = max(1, int(getattr(state, "dip_confirm_closes", DIP_CONFIRM_CLOSES_DEFAULT)))
-    no_new_low_buf = max(0.0, float(DIP_NO_NEW_LOW_BUFFER_PCT))
-
-    if last_price > buy_trigger_price:
-        state.status = "WAIT_DIP"
-        state.dip_wait_start_ts = 0.0
-        state.dip_low = 0.0
-        state.dip_higher_close_count = 0
-        return
-
-    # Dip reached: wait for bounce confirmation if enabled
-    if use_rebound:
-        if state.dip_wait_start_ts <= 0:
-            state.dip_wait_start_ts = now_ts
-            state.dip_low = last_price
+    if not use_ft_signals:
+        if state.last_trade_price is None or state.last_trade_side is None:
+            state.last_trade_price = last_price
+            state.last_trade_side = "SELL"
+            state.anchor_timestamp = now_ts
+            state.status = "WAIT_DIP"
+            state.dip_wait_start_ts = 0.0
+            state.dip_low = 0.0
             state.dip_higher_close_count = 0
-            log_event(state, f"Dip hit {last_price:.8f}. Waiting for bounce to confirm BUY.")
-        else:
-            state.dip_low = min(state.dip_low if state.dip_low > 0 else last_price, last_price)
-
-        # Track consecutive higher closes
-        if len(df) >= 2:
-            prev_close = float(df.iloc[-2]["close"])
-            if last_price > prev_close:
-                state.dip_higher_close_count += 1
-            elif last_price < prev_close:
-                state.dip_higher_close_count = 0
-                state.dip_low = min(state.dip_low, last_price)
-
-        rebound_ok = False
-        if state.dip_low > 0 and last_price >= state.dip_low * (1 + rebound_pct / 100.0):
-            rebound_ok = True
-        if state.dip_higher_close_count >= confirm_closes:
-            rebound_ok = True
-
-        timeout_hit = (now_ts - state.dip_wait_start_ts) >= rebound_timeout
-        if timeout_hit and state.dip_low > 0 and last_price >= state.dip_low * (1 + no_new_low_buf / 100.0):
-            rebound_ok = True
-
-        if not rebound_ok and not timeout_hit:
-            state.status = "WAIT_BOUNCE"
+            buy_trigger = state.last_trade_price * (1 - buy_thr / 100.0)
+            state.pending_buy_price = buy_trigger
+            log_event(state, f"Initialized. Waiting for dip: BUY trigger at {buy_trigger:.8f}")
             return
-        # proceed; clear counters
-        state.dip_wait_start_ts = 0.0
-        state.dip_low = 0.0
-        state.dip_higher_close_count = 0
+
+        if state.last_trade_side != "SELL":
+            return
+
+        age = (now_ts - state.anchor_timestamp) if state.anchor_timestamp is not None else None
+        price_above_anchor = last_price > state.last_trade_price * (1 + ANCHOR_DRIFT_REARM_PCT / 100.0)
+
+        if (age is not None and age > ANCHOR_MAX_AGE_SEC) or price_above_anchor:
+            old_anchor = state.last_trade_price
+            state.last_trade_price = last_price
+            state.anchor_timestamp = now_ts
+            state.pending_buy_price = None
+            state.dip_wait_start_ts = 0.0
+            state.dip_low = 0.0
+            state.dip_higher_close_count = 0
+            log_event(state, f"Re-anchoring BUY reference {old_anchor:.8f} -> {last_price:.8f} (age={0 if age is None else age:.0f}s).")
+
+        buy_trigger_price = state.last_trade_price * (1 - buy_thr / 100.0)
+
+        if state.pending_buy_price is None or abs(buy_trigger_price - state.pending_buy_price) > 1e-12:
+            state.pending_buy_price = buy_trigger_price
+            # keep log quieter; comment back in if you want it noisy:
+            # log_event(state, f"New BUY trigger set at {buy_trigger_price:.8f} (waiting for dip)")
+
+        use_rebound = bool(getattr(state, "use_dip_rebound", True))
+        rebound_pct = max(0.0, float(getattr(state, "rebound_confirm_pct", REBOUND_CONFIRM_PCT_DEFAULT)))
+        rebound_timeout = max(5.0, float(getattr(state, "dip_rebound_timeout_sec", DIP_REBOUND_TIMEOUT_SEC_DEFAULT)))
+        confirm_closes = max(1, int(getattr(state, "dip_confirm_closes", DIP_CONFIRM_CLOSES_DEFAULT)))
+        no_new_low_buf = max(0.0, float(DIP_NO_NEW_LOW_BUFFER_PCT))
+
+        if last_price > buy_trigger_price:
+            state.status = "WAIT_DIP"
+            state.dip_wait_start_ts = 0.0
+            state.dip_low = 0.0
+            state.dip_higher_close_count = 0
+            return
+
+        # Dip reached: wait for bounce confirmation if enabled
+        if use_rebound:
+            if state.dip_wait_start_ts <= 0:
+                state.dip_wait_start_ts = now_ts
+                state.dip_low = last_price
+                state.dip_higher_close_count = 0
+                log_event(state, f"Dip hit {last_price:.8f}. Waiting for bounce to confirm BUY.")
+            else:
+                state.dip_low = min(state.dip_low if state.dip_low > 0 else last_price, last_price)
+
+            # Track consecutive higher closes
+            if len(df) >= 2:
+                prev_close = float(df.iloc[-2]["close"])
+                if last_price > prev_close:
+                    state.dip_higher_close_count += 1
+                elif last_price < prev_close:
+                    state.dip_higher_close_count = 0
+                    state.dip_low = min(state.dip_low, last_price)
+
+            rebound_ok = False
+            if state.dip_low > 0 and last_price >= state.dip_low * (1 + rebound_pct / 100.0):
+                rebound_ok = True
+            if state.dip_higher_close_count >= confirm_closes:
+                rebound_ok = True
+
+            timeout_hit = (now_ts - state.dip_wait_start_ts) >= rebound_timeout
+            if timeout_hit and state.dip_low > 0 and last_price >= state.dip_low * (1 + no_new_low_buf / 100.0):
+                rebound_ok = True
+
+            if not rebound_ok and not timeout_hit:
+                state.status = "WAIT_BOUNCE"
+                return
+            # proceed; clear counters
+            state.dip_wait_start_ts = 0.0
+            state.dip_low = 0.0
+            state.dip_higher_close_count = 0
+
+    # Freqtrade-inspired entry filters (optional)
+    if bool(getattr(state, "ft_enabled", config.FT_LOGIC_ENABLED_DEFAULT)):
+        indicators = _ft_last_indicators(df, state)
+        if indicators:
+            entry_reasons = []
+            filters_enabled = False
+            if bool(getattr(state, "ft_entry_ema_filter", config.FT_ENTRY_EMA_FILTER_DEFAULT)):
+                filters_enabled = True
+                if indicators["ema_fast"] <= indicators["ema_slow"]:
+                    entry_reasons.append("ema")
+            if bool(getattr(state, "ft_entry_rsi_filter", config.FT_ENTRY_RSI_FILTER_DEFAULT)):
+                filters_enabled = True
+                rsi_max = float(getattr(state, "ft_rsi_entry_max", config.FT_RSI_ENTRY_MAX_DEFAULT))
+                if indicators["rsi"] > rsi_max:
+                    entry_reasons.append("rsi")
+            if bool(getattr(state, "ft_entry_vol_filter", config.FT_ENTRY_VOL_FILTER_DEFAULT)):
+                filters_enabled = True
+                vol_mult = float(getattr(state, "ft_vol_mult", config.FT_VOL_MULT_DEFAULT))
+                if indicators["vol_sma"] > 0 and indicators["volume"] < indicators["vol_sma"] * vol_mult:
+                    entry_reasons.append("volume")
+            if use_ft_signals and not filters_enabled:
+                state.status = "WAIT_FT(NO_FILTERS)"
+                return
+            if entry_reasons:
+                state.status = f"WAIT_FT({','.join(entry_reasons)})"
+                return
+        elif use_ft_signals:
+            state.status = "WAIT_FT_DATA"
+            return
 
     # size
     if DRY_RUN:
@@ -2265,6 +2426,9 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     sell_thr = (state.effective_sell_threshold_pct if state.data_driven else state.sell_threshold_pct)
 
     use_trailing = bool(getattr(state, "use_tp1_trailing", True))
+    use_ft_signals = bool(getattr(state, "ft_signal_only", config.FT_SIGNAL_ONLY_DEFAULT)) and bool(
+        getattr(state, "ft_enabled", config.FT_LOGIC_ENABLED_DEFAULT)
+    )
     use_soft_stop = bool(getattr(state, "use_soft_stop", True))
     soft_confirms = max(1, int(getattr(position, "soft_confirms_used", getattr(state, "soft_stop_confirms", SOFT_STOP_CONFIRMS_DEFAULT))))
     hard_stop_mult = max(1.0, float(getattr(position, "hard_stop_mult_used", getattr(state, "effective_hard_stop_mult", HARD_STOP_MULT_DEFAULT))))
@@ -2272,6 +2436,126 @@ def manage_position(exchange: ccxt.Exchange, state: BotState, df: pd.DataFrame):
     anchor_price = state.last_trade_price if state.last_trade_price is not None else position.entry_price
     sell_trigger = anchor_price * (1 + sell_thr / 100.0)
     tp1_fraction = max(0.2, min(float(getattr(state, "effective_tp1_frac", TP1_SELL_FRACTION)), 0.8))
+
+    # Freqtrade-inspired exits (optional)
+    if bool(getattr(state, "ft_enabled", config.FT_LOGIC_ENABLED_DEFAULT)):
+        indicators = _ft_last_indicators(df, state)
+        if indicators and not (state.open_order and state.open_order.status == "open"):
+            age_min = max(0.0, (dt.datetime.now(dt.timezone.utc) - position.entry_time).total_seconds() / 60.0)
+            profit_pct = (last_price / position.entry_price - 1.0) * 100.0 if position.entry_price > 0 else 0.0
+
+            roi_exit = False
+            if bool(getattr(state, "ft_roi_enabled", config.FT_ROI_ENABLED_DEFAULT)):
+                roi_table = _parse_roi_table(getattr(state, "ft_roi_table", config.FT_ROI_TABLE_DEFAULT))
+                roi_target = _roi_target_for_age(age_min, roi_table)
+                if roi_target > 0 and profit_pct >= roi_target:
+                    roi_exit = True
+
+            signal_exit = False
+            if bool(getattr(state, "ft_exit_signal", config.FT_EXIT_SIGNAL_ENABLED_DEFAULT)):
+                min_profit = max(0.0, float(getattr(state, "ft_exit_min_profit_pct", config.FT_EXIT_MIN_PROFIT_PCT_DEFAULT)))
+                ema_exit = indicators["ema_fast"] < indicators["ema_slow"]
+                rsi_exit = False
+                if bool(getattr(state, "ft_exit_rsi_signal", config.FT_EXIT_RSI_SIGNAL_DEFAULT)):
+                    rsi_min = float(getattr(state, "ft_rsi_exit_min", config.FT_RSI_EXIT_MIN_DEFAULT))
+                    rsi_exit = indicators["rsi"] >= rsi_min
+                if (ema_exit or rsi_exit) and profit_pct >= min_profit:
+                    signal_exit = True
+
+            if roi_exit or signal_exit:
+                reason = "ft_roi" if roi_exit else "ft_signal"
+                if state.order_mode == "limit":
+                    now = dt.datetime.now(dt.timezone.utc)
+                    oo = place_limit_sell(exchange, state, position, last_price, now)
+                    if oo:
+                        state.open_order = oo
+                        state.pending_sell_price = last_price
+                        return
+                    # If limit order couldn't be placed, fall back to normal exit logic.
+                else:
+                    filled_qty, exit_price = place_market_sell(exchange, state, position, position.qty, last_price)
+                    if filled_qty > 0:
+                        pnl = realize_pnl_for_exit(state, position, filled_qty, exit_price)
+                        state.daily_realized_pnl += pnl
+                        position.last_exit_reason = reason
+                        log_event(state, f"Exited position @ {exit_price:.8f} (reason: {reason}), PnL: {pnl:.2f} USDT")
+                        state.position = None
+                        state.status = "WAIT_DIP"
+                        state.last_trade_price = exit_price
+                        state.last_trade_side = "SELL"
+                        state.anchor_timestamp = time.time()
+                        state.pending_sell_price = None
+                        state.next_trade_time = time.time() + POLL_INTERVAL_SECONDS
+                        return
+                # fall through if exit could not be executed
+
+    if use_ft_signals:
+        full_exit = False
+        reason = None
+
+        if stop_pct_used is not None:
+            stop_price = position.entry_price * (1 - stop_pct_used / 100.0)
+            hard_stop_price = position.entry_price * (1 - (stop_pct_used * hard_stop_mult) / 100.0)
+
+            if last_price > stop_price:
+                state.soft_stop_counter = 0
+
+            if last_price <= hard_stop_price:
+                full_exit = True
+                reason = "hard_stop"
+                state.soft_stop_counter = 0
+            elif use_soft_stop:
+                if last_price <= stop_price:
+                    state.soft_stop_counter = min(soft_confirms, state.soft_stop_counter + 1)
+                    if state.soft_stop_counter >= soft_confirms:
+                        full_exit = True
+                        reason = "soft_stop"
+                        state.soft_stop_counter = 0
+                else:
+                    state.soft_stop_counter = 0
+            else:
+                if last_price <= stop_price:
+                    full_exit = True
+                    reason = "stop_loss"
+                    state.soft_stop_counter = 0
+        else:
+            state.soft_stop_counter = 0
+
+        if (not full_exit) and (
+            state.daily_realized_pnl <= DAILY_MAX_LOSS_USDT or state.daily_realized_pnl >= DAILY_MAX_PROFIT_USDT
+        ):
+            full_exit = True
+            reason = "daily_limit"
+
+        if full_exit and position.qty > 0:
+            qty_exit = position.qty
+            filled_qty, exit_price = place_market_sell(exchange, state, position, qty_exit, last_price)
+            if filled_qty > 0:
+                pnl = realize_pnl_for_exit(state, position, filled_qty, exit_price)
+                state.daily_realized_pnl += pnl
+
+                if reason in ("stop_loss", "soft_stop", "hard_stop"):
+                    now_ts = time.time()
+                    state.stop_loss_timestamps.append(now_ts)
+                    while state.stop_loss_timestamps and now_ts - state.stop_loss_timestamps[0] > 3600:
+                        state.stop_loss_timestamps.popleft()
+                    if len(state.stop_loss_timestamps) >= MAX_STOPS_PER_HOUR:
+                        state.trading_paused_until = now_ts + CIRCUIT_STOP_COOLDOWN_SEC
+                        state.paused_reason = "Too many stop losses in last hour"
+                        log_event(state, "Circuit breaker: too many stop losses. Pausing trading.")
+
+                position.last_exit_reason = reason
+                log_event(state, f"Exited position @ {exit_price:.8f} (reason: {reason}), PnL: {pnl:.2f} USDT")
+
+            state.position = None
+            state.status = "WAIT_DIP"
+            state.next_trade_time = time.time() + POLL_INTERVAL_SECONDS
+            state.last_trade_price = exit_price
+            state.last_trade_side = "SELL"
+            state.anchor_timestamp = time.time()
+            state.pending_sell_price = None
+            state.open_order = None
+        return
 
     # Legacy: single full take-profit with optional stop-loss/daily guardrails.
     if not use_trailing:
@@ -3054,10 +3338,12 @@ class BotGUI:
         self.tab_trading = ttk.Frame(self.tabs)
         self.tab_adaptive = ttk.Frame(self.tabs)
         self.tab_trending = ttk.Frame(self.tabs)
+        self.tab_freqtrade = ttk.Frame(self.tabs)
         self.tab_toggles = ttk.Frame(self.tabs)
         self.tabs.add(self.tab_trading, text="Trading")
         self.tabs.add(self.tab_adaptive, text="Adaptive")
         self.tabs.add(self.tab_trending, text="Trending")
+        self.tabs.add(self.tab_freqtrade, text="Freqtrade")
         self.tabs.add(self.tab_toggles, text="Toggles")
 
         self._build_status_card(self.tab_trading)
@@ -3068,6 +3354,7 @@ class BotGUI:
 
         self._build_adaptive_tab(self.tab_adaptive)
         self._build_trending_tab(self.tab_trending)
+        self._build_freqtrade_tab(self.tab_freqtrade)
         self._build_toggles_tab(self.tab_toggles)
 
 
@@ -3715,6 +4002,140 @@ class BotGUI:
 
         card.columnconfigure(1, weight=1)
 
+    def _build_freqtrade_tab(self, parent):
+        card = self._card(parent, "Freqtrade Logic")
+
+        self.ft_enabled_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_enabled", config.FT_LOGIC_ENABLED_DEFAULT)))
+        ttk.Label(card, text="Enable Freqtrade logic").grid(row=0, column=0, sticky="w", padx=8, pady=(4, 2))
+        ttk.Checkbutton(card, variable=self.ft_enabled_var, command=self._on_ft_enabled).grid(
+            row=0, column=1, sticky="w", padx=8, pady=(4, 2)
+        )
+
+        ttk.Separator(card).grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+
+        self.ft_entry_ema_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_entry_ema_filter", config.FT_ENTRY_EMA_FILTER_DEFAULT)))
+        ttk.Label(card, text="Entry: EMA trend filter").grid(row=2, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_entry_ema_btn = ttk.Checkbutton(card, variable=self.ft_entry_ema_var, command=self._on_ft_entry_ema_toggle)
+        self.ft_entry_ema_btn.grid(row=2, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        ttk.Label(card, text="EMA fast length").grid(row=3, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_ema_fast_var = tk.StringVar(value=str(int(getattr(self.state, "ft_ema_fast", config.FT_EMA_FAST_DEFAULT))))
+        self.ft_ema_fast_entry = ttk.Entry(card, textvariable=self.ft_ema_fast_var, width=10)
+        self.ft_ema_fast_entry.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_ema_fast_entry.bind("<Return>", self._on_ft_ema_fast)
+        self.ft_ema_fast_entry.bind("<FocusOut>", self._on_ft_ema_fast)
+
+        ttk.Label(card, text="EMA slow length").grid(row=4, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_ema_slow_var = tk.StringVar(value=str(int(getattr(self.state, "ft_ema_slow", config.FT_EMA_SLOW_DEFAULT))))
+        self.ft_ema_slow_entry = ttk.Entry(card, textvariable=self.ft_ema_slow_var, width=10)
+        self.ft_ema_slow_entry.grid(row=4, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_ema_slow_entry.bind("<Return>", self._on_ft_ema_slow)
+        self.ft_ema_slow_entry.bind("<FocusOut>", self._on_ft_ema_slow)
+
+        self.ft_entry_rsi_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_entry_rsi_filter", config.FT_ENTRY_RSI_FILTER_DEFAULT)))
+        ttk.Label(card, text="Entry: RSI filter").grid(row=5, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_entry_rsi_btn = ttk.Checkbutton(card, variable=self.ft_entry_rsi_var, command=self._on_ft_entry_rsi_toggle)
+        self.ft_entry_rsi_btn.grid(row=5, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        ttk.Label(card, text="RSI period").grid(row=6, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_rsi_period_var = tk.StringVar(value=str(int(getattr(self.state, "ft_rsi_period", config.FT_RSI_PERIOD_DEFAULT))))
+        self.ft_rsi_period_entry = ttk.Entry(card, textvariable=self.ft_rsi_period_var, width=10)
+        self.ft_rsi_period_entry.grid(row=6, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_rsi_period_entry.bind("<Return>", self._on_ft_rsi_period)
+        self.ft_rsi_period_entry.bind("<FocusOut>", self._on_ft_rsi_period)
+
+        ttk.Label(card, text="RSI max (entry)").grid(row=7, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_rsi_entry_max_var = tk.StringVar(value=f"{float(getattr(self.state, 'ft_rsi_entry_max', config.FT_RSI_ENTRY_MAX_DEFAULT)):.1f}")
+        self.ft_rsi_entry_max_entry = ttk.Entry(card, textvariable=self.ft_rsi_entry_max_var, width=10)
+        self.ft_rsi_entry_max_entry.grid(row=7, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_rsi_entry_max_entry.bind("<Return>", self._on_ft_rsi_entry_max)
+        self.ft_rsi_entry_max_entry.bind("<FocusOut>", self._on_ft_rsi_entry_max)
+
+        self.ft_entry_vol_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_entry_vol_filter", config.FT_ENTRY_VOL_FILTER_DEFAULT)))
+        ttk.Label(card, text="Entry: Volume filter").grid(row=8, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_entry_vol_btn = ttk.Checkbutton(card, variable=self.ft_entry_vol_var, command=self._on_ft_entry_vol_toggle)
+        self.ft_entry_vol_btn.grid(row=8, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        ttk.Label(card, text="Volume period").grid(row=9, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_vol_period_var = tk.StringVar(value=str(int(getattr(self.state, "ft_vol_period", config.FT_VOL_PERIOD_DEFAULT))))
+        self.ft_vol_period_entry = ttk.Entry(card, textvariable=self.ft_vol_period_var, width=10)
+        self.ft_vol_period_entry.grid(row=9, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_vol_period_entry.bind("<Return>", self._on_ft_vol_period)
+        self.ft_vol_period_entry.bind("<FocusOut>", self._on_ft_vol_period)
+
+        ttk.Label(card, text="Volume mult").grid(row=10, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_vol_mult_var = tk.StringVar(value=f"{float(getattr(self.state, 'ft_vol_mult', config.FT_VOL_MULT_DEFAULT)):.2f}")
+        self.ft_vol_mult_entry = ttk.Entry(card, textvariable=self.ft_vol_mult_var, width=10)
+        self.ft_vol_mult_entry.grid(row=10, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_vol_mult_entry.bind("<Return>", self._on_ft_vol_mult)
+        self.ft_vol_mult_entry.bind("<FocusOut>", self._on_ft_vol_mult)
+
+        ttk.Separator(card).grid(row=11, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+
+        self.ft_exit_signal_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_exit_signal", config.FT_EXIT_SIGNAL_ENABLED_DEFAULT)))
+        ttk.Label(card, text="Exit: Signal exit").grid(row=12, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_exit_signal_btn = ttk.Checkbutton(card, variable=self.ft_exit_signal_var, command=self._on_ft_exit_signal_toggle)
+        self.ft_exit_signal_btn.grid(row=12, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        self.ft_exit_rsi_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_exit_rsi_signal", config.FT_EXIT_RSI_SIGNAL_DEFAULT)))
+        ttk.Label(card, text="Exit: RSI signal").grid(row=13, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_exit_rsi_btn = ttk.Checkbutton(card, variable=self.ft_exit_rsi_var, command=self._on_ft_exit_rsi_toggle)
+        self.ft_exit_rsi_btn.grid(row=13, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        ttk.Label(card, text="RSI min (exit)").grid(row=14, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_rsi_exit_min_var = tk.StringVar(value=f"{float(getattr(self.state, 'ft_rsi_exit_min', config.FT_RSI_EXIT_MIN_DEFAULT)):.1f}")
+        self.ft_rsi_exit_min_entry = ttk.Entry(card, textvariable=self.ft_rsi_exit_min_var, width=10)
+        self.ft_rsi_exit_min_entry.grid(row=14, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_rsi_exit_min_entry.bind("<Return>", self._on_ft_rsi_exit_min)
+        self.ft_rsi_exit_min_entry.bind("<FocusOut>", self._on_ft_rsi_exit_min)
+
+        ttk.Label(card, text="Exit min profit %").grid(row=15, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_exit_min_profit_var = tk.StringVar(value=f"{float(getattr(self.state, 'ft_exit_min_profit_pct', config.FT_EXIT_MIN_PROFIT_PCT_DEFAULT)):.2f}")
+        self.ft_exit_min_profit_entry = ttk.Entry(card, textvariable=self.ft_exit_min_profit_var, width=10)
+        self.ft_exit_min_profit_entry.grid(row=15, column=1, sticky="w", padx=8, pady=(2, 2))
+        self.ft_exit_min_profit_entry.bind("<Return>", self._on_ft_exit_min_profit)
+        self.ft_exit_min_profit_entry.bind("<FocusOut>", self._on_ft_exit_min_profit)
+
+        ttk.Separator(card).grid(row=16, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+
+        self.ft_roi_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_roi_enabled", config.FT_ROI_ENABLED_DEFAULT)))
+        ttk.Label(card, text="Exit: ROI table").grid(row=17, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_roi_btn = ttk.Checkbutton(card, variable=self.ft_roi_var, command=self._on_ft_roi_toggle)
+        self.ft_roi_btn.grid(row=17, column=1, sticky="w", padx=8, pady=(2, 2))
+
+        ttk.Label(card, text="ROI table (min:roi)").grid(row=18, column=0, sticky="w", padx=8, pady=(2, 2))
+        self.ft_roi_table_var = tk.StringVar(value=str(getattr(self.state, "ft_roi_table", config.FT_ROI_TABLE_DEFAULT)))
+        self.ft_roi_table_entry = ttk.Entry(card, textvariable=self.ft_roi_table_var, width=28)
+        self.ft_roi_table_entry.grid(row=18, column=1, sticky="w", padx=8, pady=(2, 6))
+        self.ft_roi_table_entry.bind("<Return>", self._on_ft_roi_table)
+        self.ft_roi_table_entry.bind("<FocusOut>", self._on_ft_roi_table)
+
+        self.ft_signal_only_var = tk.BooleanVar(value=bool(getattr(self.state, "ft_signal_only", config.FT_SIGNAL_ONLY_DEFAULT)))
+        ttk.Label(card, text="Use signals only (ignore buy/sell thresholds)").grid(row=19, column=0, sticky="w", padx=8, pady=(2, 6))
+        self.ft_signal_only_btn = ttk.Checkbutton(card, variable=self.ft_signal_only_var, command=self._on_ft_signal_only_toggle)
+        self.ft_signal_only_btn.grid(row=19, column=1, sticky="w", padx=8, pady=(2, 6))
+
+        self.ft_controls = [
+            self.ft_entry_ema_btn,
+            self.ft_ema_fast_entry,
+            self.ft_ema_slow_entry,
+            self.ft_entry_rsi_btn,
+            self.ft_rsi_period_entry,
+            self.ft_rsi_entry_max_entry,
+            self.ft_entry_vol_btn,
+            self.ft_vol_period_entry,
+            self.ft_vol_mult_entry,
+            self.ft_exit_signal_btn,
+            self.ft_exit_rsi_btn,
+            self.ft_rsi_exit_min_entry,
+            self.ft_exit_min_profit_entry,
+            self.ft_roi_btn,
+            self.ft_roi_table_entry,
+            self.ft_signal_only_btn,
+        ]
+
+        card.columnconfigure(1, weight=1)
+
     def _sync_tf_selection(self, tfs: List[str]):
         try:
             self.tf_list.selection_clear(0, "end")
@@ -4176,6 +4597,147 @@ class BotGUI:
         self.send_cmd("auto_coin_force")
         log_event(self.state, "Auto-coin force switch requested.")
 
+    def _on_ft_enabled(self):
+        want = bool(self.ft_enabled_var.get())
+        with self.state.lock:
+            self.state.ft_enabled = want
+        save_settings(self.state)
+        log_event(self.state, f"Freqtrade logic {'ENABLED' if want else 'DISABLED'}.")
+
+    def _on_ft_entry_ema_toggle(self):
+        want = bool(self.ft_entry_ema_var.get())
+        with self.state.lock:
+            self.state.ft_entry_ema_filter = want
+        save_settings(self.state)
+
+    def _on_ft_entry_rsi_toggle(self):
+        want = bool(self.ft_entry_rsi_var.get())
+        with self.state.lock:
+            self.state.ft_entry_rsi_filter = want
+        save_settings(self.state)
+
+    def _on_ft_entry_vol_toggle(self):
+        want = bool(self.ft_entry_vol_var.get())
+        with self.state.lock:
+            self.state.ft_entry_vol_filter = want
+        save_settings(self.state)
+
+    def _on_ft_exit_signal_toggle(self):
+        want = bool(self.ft_exit_signal_var.get())
+        with self.state.lock:
+            self.state.ft_exit_signal = want
+        save_settings(self.state)
+
+    def _on_ft_exit_rsi_toggle(self):
+        want = bool(self.ft_exit_rsi_var.get())
+        with self.state.lock:
+            self.state.ft_exit_rsi_signal = want
+        save_settings(self.state)
+
+    def _on_ft_roi_toggle(self):
+        want = bool(self.ft_roi_var.get())
+        with self.state.lock:
+            self.state.ft_roi_enabled = want
+        save_settings(self.state)
+
+    def _on_ft_signal_only_toggle(self):
+        want = bool(self.ft_signal_only_var.get())
+        with self.state.lock:
+            self.state.ft_signal_only = want
+        save_settings(self.state)
+        log_event(self.state, f"Freqtrade signal-only {'ENABLED' if want else 'DISABLED'}.")
+
+    def _on_ft_ema_fast(self, event=None):
+        raw = self.ft_ema_fast_var.get().strip()
+        try:
+            v = max(2, int(float(raw)))
+        except Exception:
+            return
+        self.state.ft_ema_fast = v
+        self.ft_ema_fast_var.set(str(v))
+        save_settings(self.state)
+
+    def _on_ft_ema_slow(self, event=None):
+        raw = self.ft_ema_slow_var.get().strip()
+        try:
+            v = max(3, int(float(raw)))
+        except Exception:
+            return
+        self.state.ft_ema_slow = v
+        self.ft_ema_slow_var.set(str(v))
+        save_settings(self.state)
+
+    def _on_ft_rsi_period(self, event=None):
+        raw = self.ft_rsi_period_var.get().strip()
+        try:
+            v = max(2, int(float(raw)))
+        except Exception:
+            return
+        self.state.ft_rsi_period = v
+        self.ft_rsi_period_var.set(str(v))
+        save_settings(self.state)
+
+    def _on_ft_rsi_entry_max(self, event=None):
+        raw = self.ft_rsi_entry_max_var.get().strip()
+        try:
+            v = max(0.0, float(raw))
+        except Exception:
+            return
+        self.state.ft_rsi_entry_max = v
+        self.ft_rsi_entry_max_var.set(f"{v:.1f}")
+        save_settings(self.state)
+
+    def _on_ft_rsi_exit_min(self, event=None):
+        raw = self.ft_rsi_exit_min_var.get().strip()
+        try:
+            v = max(0.0, float(raw))
+        except Exception:
+            return
+        self.state.ft_rsi_exit_min = v
+        self.ft_rsi_exit_min_var.set(f"{v:.1f}")
+        save_settings(self.state)
+
+    def _on_ft_vol_period(self, event=None):
+        raw = self.ft_vol_period_var.get().strip()
+        try:
+            v = max(2, int(float(raw)))
+        except Exception:
+            return
+        self.state.ft_vol_period = v
+        self.ft_vol_period_var.set(str(v))
+        save_settings(self.state)
+
+    def _on_ft_vol_mult(self, event=None):
+        raw = self.ft_vol_mult_var.get().strip()
+        try:
+            v = max(0.0, float(raw))
+        except Exception:
+            return
+        self.state.ft_vol_mult = v
+        self.ft_vol_mult_var.set(f"{v:.2f}")
+        save_settings(self.state)
+
+    def _on_ft_exit_min_profit(self, event=None):
+        raw = self.ft_exit_min_profit_var.get().strip()
+        try:
+            v = max(0.0, float(raw))
+        except Exception:
+            return
+        self.state.ft_exit_min_profit_pct = v
+        self.ft_exit_min_profit_var.set(f"{v:.2f}")
+        save_settings(self.state)
+
+    def _on_ft_roi_table(self, event=None):
+        raw = self.ft_roi_table_var.get().strip()
+        if not raw:
+            return
+        table = _parse_roi_table(raw)
+        if not table:
+            return
+        self.state.ft_roi_table = raw
+        self.ft_roi_table_var.set(raw)
+        save_settings(self.state)
+
     def _on_auto_coin_table_select(self, event=None):
         try:
             if not hasattr(self, "auto_coin_table") or not hasattr(self, "auto_coin_select_var"):
@@ -4539,6 +5101,23 @@ class BotGUI:
             auto_coin_scan_interval_sec = float(getattr(s, "auto_coin_scan_interval_sec", AUTO_COIN_SCAN_INTERVAL_SEC_DEFAULT))
             auto_coin_last_switch_ts = float(getattr(s, "auto_coin_last_switch_ts", 0.0))
             auto_coin_dwell_min = float(getattr(s, "auto_coin_dwell_min", AUTO_COIN_DWELL_MIN_DEFAULT))
+            ft_enabled = bool(getattr(s, "ft_enabled", config.FT_LOGIC_ENABLED_DEFAULT))
+            ft_signal_only = bool(getattr(s, "ft_signal_only", config.FT_SIGNAL_ONLY_DEFAULT))
+            ft_entry_ema_filter = bool(getattr(s, "ft_entry_ema_filter", config.FT_ENTRY_EMA_FILTER_DEFAULT))
+            ft_entry_rsi_filter = bool(getattr(s, "ft_entry_rsi_filter", config.FT_ENTRY_RSI_FILTER_DEFAULT))
+            ft_entry_vol_filter = bool(getattr(s, "ft_entry_vol_filter", config.FT_ENTRY_VOL_FILTER_DEFAULT))
+            ft_exit_signal = bool(getattr(s, "ft_exit_signal", config.FT_EXIT_SIGNAL_ENABLED_DEFAULT))
+            ft_exit_rsi_signal = bool(getattr(s, "ft_exit_rsi_signal", config.FT_EXIT_RSI_SIGNAL_DEFAULT))
+            ft_roi_enabled = bool(getattr(s, "ft_roi_enabled", config.FT_ROI_ENABLED_DEFAULT))
+            ft_ema_fast = int(getattr(s, "ft_ema_fast", config.FT_EMA_FAST_DEFAULT))
+            ft_ema_slow = int(getattr(s, "ft_ema_slow", config.FT_EMA_SLOW_DEFAULT))
+            ft_rsi_period = int(getattr(s, "ft_rsi_period", config.FT_RSI_PERIOD_DEFAULT))
+            ft_rsi_entry_max = float(getattr(s, "ft_rsi_entry_max", config.FT_RSI_ENTRY_MAX_DEFAULT))
+            ft_rsi_exit_min = float(getattr(s, "ft_rsi_exit_min", config.FT_RSI_EXIT_MIN_DEFAULT))
+            ft_vol_period = int(getattr(s, "ft_vol_period", config.FT_VOL_PERIOD_DEFAULT))
+            ft_vol_mult = float(getattr(s, "ft_vol_mult", config.FT_VOL_MULT_DEFAULT))
+            ft_exit_min_profit = float(getattr(s, "ft_exit_min_profit_pct", config.FT_EXIT_MIN_PROFIT_PCT_DEFAULT))
+            ft_roi_table = str(getattr(s, "ft_roi_table", config.FT_ROI_TABLE_DEFAULT))
 
         self.root.title(f"{SYMBOL} · Auto Scalper")
         self.status_var.set(status)
@@ -4602,6 +5181,71 @@ class BotGUI:
             if hasattr(self, "ioc_toggle_var"):
                 try:
                     self.ioc_toggle_var.set(bool(use_ioc_cap))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_enabled_var"):
+                try:
+                    self.ft_enabled_var.set(bool(ft_enabled))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_entry_ema_var"):
+                try:
+                    self.ft_entry_ema_var.set(bool(ft_entry_ema_filter))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_entry_rsi_var"):
+                try:
+                    self.ft_entry_rsi_var.set(bool(ft_entry_rsi_filter))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_entry_vol_var"):
+                try:
+                    self.ft_entry_vol_var.set(bool(ft_entry_vol_filter))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_exit_signal_var"):
+                try:
+                    self.ft_exit_signal_var.set(bool(ft_exit_signal))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_exit_rsi_var"):
+                try:
+                    self.ft_exit_rsi_var.set(bool(ft_exit_rsi_signal))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_roi_var"):
+                try:
+                    self.ft_roi_var.set(bool(ft_roi_enabled))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_signal_only_var"):
+                try:
+                    self.ft_signal_only_var.set(bool(ft_signal_only))
+                except Exception:
+                    pass
+            if hasattr(self, "ft_ema_fast_var"):
+                self.ft_ema_fast_var.set(str(ft_ema_fast))
+            if hasattr(self, "ft_ema_slow_var"):
+                self.ft_ema_slow_var.set(str(ft_ema_slow))
+            if hasattr(self, "ft_rsi_period_var"):
+                self.ft_rsi_period_var.set(str(ft_rsi_period))
+            if hasattr(self, "ft_rsi_entry_max_var"):
+                self.ft_rsi_entry_max_var.set(f"{ft_rsi_entry_max:.1f}")
+            if hasattr(self, "ft_rsi_exit_min_var"):
+                self.ft_rsi_exit_min_var.set(f"{ft_rsi_exit_min:.1f}")
+            if hasattr(self, "ft_vol_period_var"):
+                self.ft_vol_period_var.set(str(ft_vol_period))
+            if hasattr(self, "ft_vol_mult_var"):
+                self.ft_vol_mult_var.set(f"{ft_vol_mult:.2f}")
+            if hasattr(self, "ft_exit_min_profit_var"):
+                self.ft_exit_min_profit_var.set(f"{ft_exit_min_profit:.2f}")
+            if hasattr(self, "ft_roi_table_var"):
+                self.ft_roi_table_var.set(ft_roi_table)
+            if hasattr(self, "ft_controls"):
+                try:
+                    st = "normal" if ft_enabled else "disabled"
+                    for w in self.ft_controls:
+                        w.configure(state=st)
                 except Exception:
                     pass
             if hasattr(self, "ap_controls"):
@@ -5031,6 +5675,69 @@ def run_bot():
                     state.auto_coin_candidates_n = max(5, int(float(settings["auto_coin_candidates_n"])))
                 except Exception:
                     state.auto_coin_candidates_n = AUTO_COIN_CANDIDATES_N_DEFAULT
+
+            # Freqtrade-inspired logic
+            if "ft_enabled" in settings:
+                state.ft_enabled = bool(settings["ft_enabled"])
+            if "ft_signal_only" in settings:
+                state.ft_signal_only = bool(settings["ft_signal_only"])
+            if "ft_entry_ema_filter" in settings:
+                state.ft_entry_ema_filter = bool(settings["ft_entry_ema_filter"])
+            if "ft_entry_rsi_filter" in settings:
+                state.ft_entry_rsi_filter = bool(settings["ft_entry_rsi_filter"])
+            if "ft_entry_vol_filter" in settings:
+                state.ft_entry_vol_filter = bool(settings["ft_entry_vol_filter"])
+            if "ft_exit_signal" in settings:
+                state.ft_exit_signal = bool(settings["ft_exit_signal"])
+            if "ft_exit_rsi_signal" in settings:
+                state.ft_exit_rsi_signal = bool(settings["ft_exit_rsi_signal"])
+            if "ft_roi_enabled" in settings:
+                state.ft_roi_enabled = bool(settings["ft_roi_enabled"])
+            if "ft_ema_fast" in settings:
+                try:
+                    state.ft_ema_fast = max(2, int(float(settings["ft_ema_fast"])))
+                except Exception:
+                    state.ft_ema_fast = config.FT_EMA_FAST_DEFAULT
+            if "ft_ema_slow" in settings:
+                try:
+                    state.ft_ema_slow = max(3, int(float(settings["ft_ema_slow"])))
+                except Exception:
+                    state.ft_ema_slow = config.FT_EMA_SLOW_DEFAULT
+            if "ft_rsi_period" in settings:
+                try:
+                    state.ft_rsi_period = max(2, int(float(settings["ft_rsi_period"])))
+                except Exception:
+                    state.ft_rsi_period = config.FT_RSI_PERIOD_DEFAULT
+            if "ft_rsi_entry_max" in settings:
+                try:
+                    state.ft_rsi_entry_max = max(0.0, float(settings["ft_rsi_entry_max"]))
+                except Exception:
+                    state.ft_rsi_entry_max = config.FT_RSI_ENTRY_MAX_DEFAULT
+            if "ft_rsi_exit_min" in settings:
+                try:
+                    state.ft_rsi_exit_min = max(0.0, float(settings["ft_rsi_exit_min"]))
+                except Exception:
+                    state.ft_rsi_exit_min = config.FT_RSI_EXIT_MIN_DEFAULT
+            if "ft_vol_period" in settings:
+                try:
+                    state.ft_vol_period = max(2, int(float(settings["ft_vol_period"])))
+                except Exception:
+                    state.ft_vol_period = config.FT_VOL_PERIOD_DEFAULT
+            if "ft_vol_mult" in settings:
+                try:
+                    state.ft_vol_mult = max(0.0, float(settings["ft_vol_mult"]))
+                except Exception:
+                    state.ft_vol_mult = config.FT_VOL_MULT_DEFAULT
+            if "ft_exit_min_profit_pct" in settings:
+                try:
+                    state.ft_exit_min_profit_pct = max(0.0, float(settings["ft_exit_min_profit_pct"]))
+                except Exception:
+                    state.ft_exit_min_profit_pct = config.FT_EXIT_MIN_PROFIT_PCT_DEFAULT
+            if "ft_roi_table" in settings:
+                try:
+                    state.ft_roi_table = str(settings["ft_roi_table"])
+                except Exception:
+                    state.ft_roi_table = config.FT_ROI_TABLE_DEFAULT
             if "autopilot" in settings and isinstance(settings["autopilot"], dict):
                 for k, v in settings["autopilot"].items():
                     try:

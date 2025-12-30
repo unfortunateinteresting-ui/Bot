@@ -80,6 +80,25 @@ class BotState:
     effective_edge_floor: float = 0.0
     stop_loss_effective_pct: Optional[float] = None
     auto_buy_pct_effective: float = config.AUTO_BUY_PCT_DEFAULT
+
+    # Freqtrade-inspired logic (optional)
+    ft_enabled: bool = config.FT_LOGIC_ENABLED_DEFAULT
+    ft_signal_only: bool = config.FT_SIGNAL_ONLY_DEFAULT
+    ft_entry_ema_filter: bool = config.FT_ENTRY_EMA_FILTER_DEFAULT
+    ft_entry_rsi_filter: bool = config.FT_ENTRY_RSI_FILTER_DEFAULT
+    ft_entry_vol_filter: bool = config.FT_ENTRY_VOL_FILTER_DEFAULT
+    ft_exit_signal: bool = config.FT_EXIT_SIGNAL_ENABLED_DEFAULT
+    ft_exit_rsi_signal: bool = config.FT_EXIT_RSI_SIGNAL_DEFAULT
+    ft_roi_enabled: bool = config.FT_ROI_ENABLED_DEFAULT
+    ft_ema_fast: int = config.FT_EMA_FAST_DEFAULT
+    ft_ema_slow: int = config.FT_EMA_SLOW_DEFAULT
+    ft_rsi_period: int = config.FT_RSI_PERIOD_DEFAULT
+    ft_rsi_entry_max: float = config.FT_RSI_ENTRY_MAX_DEFAULT
+    ft_rsi_exit_min: float = config.FT_RSI_EXIT_MIN_DEFAULT
+    ft_vol_period: int = config.FT_VOL_PERIOD_DEFAULT
+    ft_vol_mult: float = config.FT_VOL_MULT_DEFAULT
+    ft_exit_min_profit_pct: float = config.FT_EXIT_MIN_PROFIT_PCT_DEFAULT
+    ft_roi_table: str = config.FT_ROI_TABLE_DEFAULT
     # Auto coin (trending scanner)
     auto_coin_enabled: bool = config.AUTO_COIN_ENABLED_DEFAULT
     auto_coin_policy: str = config.AUTO_COIN_POLICY_DEFAULT

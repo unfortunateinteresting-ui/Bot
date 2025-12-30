@@ -59,6 +59,25 @@ def save_settings(state: BotState) -> None:
                 "auto_coin_hysteresis_pct": float(getattr(state, "auto_coin_hysteresis_pct", config.AUTO_COIN_HYSTERESIS_PCT_DEFAULT)),
                 "auto_coin_candidates_n": int(getattr(state, "auto_coin_candidates_n", config.AUTO_COIN_CANDIDATES_N_DEFAULT)),
 
+                # Freqtrade-inspired logic
+                "ft_enabled": bool(getattr(state, "ft_enabled", config.FT_LOGIC_ENABLED_DEFAULT)),
+                "ft_signal_only": bool(getattr(state, "ft_signal_only", config.FT_SIGNAL_ONLY_DEFAULT)),
+                "ft_entry_ema_filter": bool(getattr(state, "ft_entry_ema_filter", config.FT_ENTRY_EMA_FILTER_DEFAULT)),
+                "ft_entry_rsi_filter": bool(getattr(state, "ft_entry_rsi_filter", config.FT_ENTRY_RSI_FILTER_DEFAULT)),
+                "ft_entry_vol_filter": bool(getattr(state, "ft_entry_vol_filter", config.FT_ENTRY_VOL_FILTER_DEFAULT)),
+                "ft_exit_signal": bool(getattr(state, "ft_exit_signal", config.FT_EXIT_SIGNAL_ENABLED_DEFAULT)),
+                "ft_exit_rsi_signal": bool(getattr(state, "ft_exit_rsi_signal", config.FT_EXIT_RSI_SIGNAL_DEFAULT)),
+                "ft_roi_enabled": bool(getattr(state, "ft_roi_enabled", config.FT_ROI_ENABLED_DEFAULT)),
+                "ft_ema_fast": int(getattr(state, "ft_ema_fast", config.FT_EMA_FAST_DEFAULT)),
+                "ft_ema_slow": int(getattr(state, "ft_ema_slow", config.FT_EMA_SLOW_DEFAULT)),
+                "ft_rsi_period": int(getattr(state, "ft_rsi_period", config.FT_RSI_PERIOD_DEFAULT)),
+                "ft_rsi_entry_max": float(getattr(state, "ft_rsi_entry_max", config.FT_RSI_ENTRY_MAX_DEFAULT)),
+                "ft_rsi_exit_min": float(getattr(state, "ft_rsi_exit_min", config.FT_RSI_EXIT_MIN_DEFAULT)),
+                "ft_vol_period": int(getattr(state, "ft_vol_period", config.FT_VOL_PERIOD_DEFAULT)),
+                "ft_vol_mult": float(getattr(state, "ft_vol_mult", config.FT_VOL_MULT_DEFAULT)),
+                "ft_exit_min_profit_pct": float(getattr(state, "ft_exit_min_profit_pct", config.FT_EXIT_MIN_PROFIT_PCT_DEFAULT)),
+                "ft_roi_table": str(getattr(state, "ft_roi_table", config.FT_ROI_TABLE_DEFAULT)),
+
                 # lifetime stats
                 "total_realized_pnl": float(getattr(state, "total_realized_pnl", 0.0)),
                 "total_runtime_sec": float(getattr(state, "total_runtime_sec", 0.0)) + max(0.0, (time.time() - float(getattr(state, "session_start_ts", time.time())))),
